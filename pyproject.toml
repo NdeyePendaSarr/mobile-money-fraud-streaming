@@ -1,0 +1,43 @@
+[project]
+name = "mobile-money-fraud-streaming"
+version = "0.1.0"
+description = "Détection d'anomalies en temps réel sur des transactions mobile money fictives (Kafka, Spark, PostgreSQL)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "confluent-kafka>=2.12",
+    "psycopg[binary]>=3.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18",
+    "pytest>=8.4",
+    "ruff>=0.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["scripts", "tests"]
+
+# confluent_kafka.admin réexporte ConfigResource, ResourceType… sans __all__ :
+# on autorise la réexportation implicite pour ce seul module.
+[[tool.mypy.overrides]]
+module = ["confluent_kafka.admin"]
+implicit_reexport = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

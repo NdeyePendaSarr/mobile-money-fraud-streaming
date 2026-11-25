@@ -1,0 +1,21 @@
+# Secrets : seul .env.example est versionné
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Checkpoints Spark Structured Streaming (phases 3 à 6), supprimés par make reset
+checkpoints/
+
+# Éditeurs et système
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
