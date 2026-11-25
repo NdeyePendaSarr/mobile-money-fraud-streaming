@@ -15,10 +15,10 @@ KAFKA_OUTIL := $(COMPOSE) --profile streaming exec -T -e KAFKA_HEAP_OPTS="-Xms32
 UV_RUN := uv run --env-file $(ENV_FILE)
 
 .DEFAULT_GOAL := help
-.PHONY: help env install up down reset topics stats check lint typecheck test infra
+.PHONY: help env install up down reset topics stats generate check lint typecheck test test-integration infra
 
 help: ## Liste les commandes
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
 
 # Docker Compose et uv donnent la priorité aux variables du shell sur $(ENV_FILE) :
 # un POSTGRES_PORT=5433 exporté pour le projet 1 a déjà écrasé le .env. On refuse
@@ -60,17 +60,25 @@ topics: env ## Liste et décrit les topics Kafka
 stats: ## Mémoire et CPU des conteneurs (instantané)
 	docker stats --no-stream --format 'table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}'
 
+# Générateur lancé sur l'hôte (H17), vers 127.0.0.1:9092 et 127.0.0.1:5434
+generate: env ## Lance le générateur : make generate ARGS="--seed 42 --start … --duration 1d"
+	$(UV_RUN) python -m producer.producer $(ARGS)
+
 check: lint typecheck test infra ## Lint, types, tests, puis contrôle de l'infrastructure (infra)
 
 lint:
-	uv run ruff format --check scripts tests
-	uv run ruff check scripts tests
+	uv run ruff format --check scripts tests producer
+	uv run ruff check scripts tests producer
 
 typecheck:
 	uv run mypy
 
+# Les tests d'intégration écrivent un run en base : hors de make check
 test:
-	uv run pytest -q
+	uv run pytest -q -m "not integration"
+
+test-integration: env ## Tests d'intégration (services démarrés ; écrit un run en base)
+	$(UV_RUN) pytest -q -m integration
 
 infra: env ## Ports publiés, topics, 8 tables, detected_at immuable (services démarrés)
 	$(UV_RUN) python -m scripts.check_infra

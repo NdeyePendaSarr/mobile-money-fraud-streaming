@@ -1,0 +1,71 @@
+# Paramètres du générateur SenPay (cadrage de la phase 2, H7 à H11).
+# Valeurs ILLUSTRATIVES : ce ne sont ni des statistiques réelles, ni des plafonds
+# réglementaires. Les seuils des règles de détection vivent ailleurs
+# (config/rules.toml, phase 4) : le générateur ne les lit pas.
+
+# Fuseau métier (F9) : sert aux heures « de nuit » et aux poids horaires
+timezone = "Africa/Dakar"
+
+[amounts]
+# Bornes de tout montant envoyé (schéma v1, §2.1)
+min_xof = 100
+max_xof = 2_000_000
+
+[population]
+n_clients = 10_000
+n_agents = 300
+n_merchants = 200
+# Région habituelle des clients et région des agents (poids relatifs)
+region_weights = { "Dakar" = 0.40, "Thiès" = 0.15, "Diourbel" = 0.12, "Saint-Louis" = 0.10, "Kaolack" = 0.13, "Ziguinchor" = 0.10 }
+# Poids d'activité d'un client : loi log-normale (0, activity_sigma), puis normalisé.
+# Quelques gros utilisateurs, beaucoup de petits.
+activity_sigma = 1.0
+# Montants sortants d'un client : log-normale (mu_client, amount_sigma).
+# mu_client ~ normale (amount_mu_mean, amount_mu_sd) ; médiane du client = exp(mu_client).
+amount_mu_mean = 9.2          # exp(9,2) ≈ 9 900 XOF
+amount_mu_sd = 0.7
+amount_sigma = 0.9
+# CASH_IN : même sigma, mu décalé (les dépôts sont plus gros que les sorties)
+cash_in_mu_shift = 0.7
+# first_seen du profil d'amorçage = sim_start − U(min ; max) jours (H9)
+first_seen_days_min = 30
+first_seen_days_max = 720
+
+[traffic]
+tx_per_day = 30_000
+# 24 poids relatifs, indexés par l'heure locale (creux la nuit)
+hourly_weights = [
+    0.30, 0.20, 0.15, 0.10, 0.10, 0.20,  # 00 h – 05 h
+    0.60, 1.20, 1.80, 2.00, 2.00, 2.00,  # 06 h – 11 h
+    2.10, 2.00, 1.90, 1.90, 2.00, 2.20,  # 12 h – 17 h
+    2.30, 2.20, 1.80, 1.40, 0.90, 0.50,  # 18 h – 23 h
+]
+type_weights = { "TRANSFER" = 0.45, "PAYMENT" = 0.25, "CASH_IN" = 0.15, "CASH_OUT" = 0.15 }
+# Canal des TRANSFER et PAYMENT (CASH_IN et CASH_OUT passent toujours par un agent)
+channel_weights = { "APP" = 0.60, "USSD" = 0.40 }
+# Part des transactions faites dans la région habituelle du client
+home_region_share = 0.95
+
+# Épisodes injectés (§2 du cadrage) : nombre moyen par jour simulé, tiré selon un
+# processus de Poisson sur la fenêtre horaire autorisée.
+[episodes.rafale]                # → R1
+per_day = 15
+min_transfers = 6
+max_transfers = 10
+max_duration_s = 90              # F17 : au plus 90 s, toujours dans une fenêtre de 2 min
+
+[episodes.montant_anormal]       # → R2
+per_day = 50
+factor_min = 15.0                # montant = max(floor_xof ; médiane × U(min ; max))
+factor_max = 50.0
+floor_xof = 50_000
+min_history = 5                  # nb_tx_30j minimal du client (F14)
+hour_start = 6                   # heure locale, [06:00 ; 23:00[ : jamais de nuit (R3)
+hour_end = 23
+
+[episodes.nuit_gros_montant]     # → R3
+per_day = 20
+amount_min_xof = 500_001
+amount_max_xof = 2_000_000
+hour_start = 1                   # heure locale, [01:00 ; 05:00[
+hour_end = 5

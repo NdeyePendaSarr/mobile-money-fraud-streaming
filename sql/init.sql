@@ -84,11 +84,16 @@ create table generator_runs (
     seed         bigint      not null,
     sim_start    timestamptz not null,              -- début de la plage simulée
     sim_end      timestamptz,                       -- null tant que le run tourne
-    speed        numeric     not null check (speed > 0),
+    speed        numeric     check (speed > 0),     -- null : --speed max (sans attente, H6)
+    -- Configuration complète, graine et options : le run est rejouable depuis la base (H17)
+    params       jsonb       not null check (jsonb_typeof(params) = 'object'),
     nb_sent      bigint      not null default 0 check (nb_sent >= 0),
     nb_late      bigint      not null default 0 check (nb_late >= 0),
     nb_very_late bigint      not null default 0 check (nb_very_late >= 0),
     nb_invalid   bigint      not null default 0 check (nb_invalid >= 0),
+    -- Messages invalides par motif (H15), ex. {"JSON_ILLISIBLE": 3}
+    nb_invalid_by_reason jsonb not null default '{}'
+        check (jsonb_typeof(nb_invalid_by_reason) = 'object'),
     -- Nombre d'épisodes par type d'anomalie, ex. {"RAFALE": 12, "MONTANT_ANORMAL": 30}
     nb_episodes  jsonb       not null default '{}' check (jsonb_typeof(nb_episodes) = 'object'),
     started_at   timestamptz not null default now(),  -- temps réel

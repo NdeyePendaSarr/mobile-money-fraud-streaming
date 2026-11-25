@@ -26,11 +26,13 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# Commentaires et messages en français : ces signes sont voulus, pas ambigus
+allowed-confusables = ["×", "−", "–"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["scripts", "tests"]
+files = ["scripts", "tests", "producer"]
 
 # confluent_kafka.admin réexporte ConfigResource, ResourceType… sans __all__ :
 # on autorise la réexportation implicite pour ce seul module.
@@ -39,5 +41,8 @@ module = ["confluent_kafka.admin"]
 implicit_reexport = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "producer/tests"]
 pythonpath = ["."]
+markers = [
+    "integration: exige Kafka et PostgreSQL démarrés (make up) ; écrit un run en base",
+]
