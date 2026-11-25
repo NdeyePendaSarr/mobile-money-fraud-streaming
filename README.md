@@ -3,7 +3,7 @@
 > **EN —** Streaming pipeline for a fictional Senegalese mobile money fintech: synthetic
 > transactions → Kafka → Spark Structured Streaming → explainable fraud rules, per-minute KPIs and
 > alerts in PostgreSQL, live Grafana dashboard; a daily PySpark batch on the Parquet archive feeds a
-> compliance report in Power BI. **Work in progress: phase 1 (infrastructure) of 9.**
+> compliance report in Power BI. **Work in progress: phases 0 to 2 of 0–9 done (design, infrastructure, data generator); next: first Spark consumer.**
 
 > ⚠️ **Données 100 % fictives.** SenPay est une fintech **fictive** ; aucune marque réelle n'est
 > utilisée. Les identifiants (`U-000123`, `M-0042`, `A-0137`) ne ressemblent pas à des numéros de
@@ -39,12 +39,12 @@ flowchart LR
     pg --> pbi["Power BI<br/>rapport conformité"]
 
     classDef enplace fill:#d1fadf,stroke:#1b7f3b;
-    class tx,dl,pg enplace;
+    class gen,tx,dl,pg enplace;
 ```
 
-En vert : ce qui est en place à la fin de la phase 1. Deux profils Docker Compose, jamais lancés
-ensemble : `streaming` (Kafka, PostgreSQL, puis générateur, Spark, Grafana) et `batch`
-(PostgreSQL, puis Airflow et Spark batch).
+En vert : ce qui est en place à la fin de la phase 2. Deux profils Docker Compose, jamais lancés
+ensemble : `streaming` (Kafka, PostgreSQL et le générateur lancé sur l'hôte, puis Spark, Grafana)
+et `batch` (PostgreSQL, puis Airflow et Spark batch).
 
 ## Avancement
 
