@@ -113,18 +113,39 @@ class Truth:
 class Emission:
     """Un message à envoyer, au temps simulé ``emit_sim_time`` (H1).
 
-    En phase 2 (noyau), ``emit_sim_time`` = ``event_time`` : les retards (H14)
-    décaleront l'émission, jamais ``event_time``.
+    - ``emit_sim_time`` ≥ ``event_time`` : un retard (H14) décale l'émission,
+      jamais ``event_time`` ; ``delay`` vaut ``None``, ``"LATE"`` ou ``"VERY_LATE"``.
+    - ``transaction`` est toujours la transaction valide d'origine ; si le message
+      est invalide (H15), ``invalid_reason`` donne le motif et ``value`` la
+      version corrompue qui part dans Kafka (la version valide n'est pas envoyée).
+    - Motif ``EVENT_TIME_FUTUR`` : la valeur dépend de l'heure réelle d'envoi.
+      ``value`` vaut alors ``None`` et ``future_offset_ms`` donne le décalage ;
+      ``render(heure_reelle)`` construit le message au moment de l'envoi.
     """
 
     emit_sim_time: datetime
     key: str  # clé Kafka = sender_id
-    value: str  # message JSON
+    value: str | None  # message JSON ; None seulement pour EVENT_TIME_FUTUR
     transaction: Transaction
     truth: Truth | None
+    delay: str | None = None
+    invalid_reason: str | None = None
+    future_offset_ms: int | None = None
+
+    def render(self, real_now: datetime) -> str:
+        """Message à envoyer ; ``real_now`` ne sert qu'au motif EVENT_TIME_FUTUR."""
+        if self.value is not None:
+            return self.value
+        if self.future_offset_ms is None:
+            raise ValueError("émission sans valeur ni décalage futur")
+        message = self.transaction.to_message()
+        message["event_time"] = format_event_time(
+            real_now + timedelta(milliseconds=self.future_offset_ms)
+        )
+        return json.dumps(message, ensure_ascii=False, separators=(",", ":"))
 
     def to_jsonl(self) -> str:
-        """Ligne du fichier ``--dry-run`` : stable, comparée par sha256."""
+        """Ligne du fichier ``--dry-run`` : stable (aucune heure réelle), comparée par sha256."""
         truth = (
             None
             if self.truth is None
@@ -139,6 +160,9 @@ class Emission:
                 "emit_sim_time": format_event_time(self.emit_sim_time),
                 "key": self.key,
                 "value": self.value,
+                "delay": self.delay,
+                "invalid_reason": self.invalid_reason,
+                "future_offset_ms": self.future_offset_ms,
                 "truth": truth,
             },
             ensure_ascii=False,

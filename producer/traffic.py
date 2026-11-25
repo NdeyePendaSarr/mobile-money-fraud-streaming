@@ -6,25 +6,69 @@ de Poisson d'intensité constante (``tx_per_day`` × poids de l'heure locale) :
 les écarts entre deux transactions sont exponentiels. Le processus est sans
 mémoire, donc repartir de zéro à chaque tranche ne biaise rien.
 
-Le trafic près des seuils (H10) est un complément de fin de phase : absent ici.
+Le **trafic près des seuils** (H10, ``generate_near_threshold``) est du trafic
+normal, absent de la vérité terrain : il rend les faux positifs possibles. Chaque
+sorte a son flux aléatoire (``{seed}:near_threshold:{SORTE}``), indépendant du
+trafic ordinaire et des épisodes.
 """
 
 from __future__ import annotations
 
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from producer.config import GeneratorConfig
-from producer.events import REGIONS, Transaction, from_ms, to_ms, uuid_from
-from producer.profiles import Client, Population
+from producer.events import OUTGOING_TYPES, REGIONS, Transaction, from_ms, to_ms, uuid_from
+from producer.profiles import Client, Population, expected_outgoing_30d
 
 HOUR_MS = 3_600_000
+DAY_MS = 24 * HOUR_MS
 
 
 def local_hour(epoch_ms: int, tz: ZoneInfo) -> int:
     """Heure locale (0–23) d'un instant, dans le fuseau métier (F9)."""
     return from_ms(epoch_ms).astimezone(tz).hour
+
+
+def local_windows(
+    start_ms: int, end_ms: int, tz: ZoneInfo, hour_start: int, hour_end: int
+) -> list[tuple[int, int]]:
+    """Plages [hour_start ; hour_end[ en heure locale, intersectées avec [start ; end[ (ms)."""
+    first_day = from_ms(start_ms).astimezone(tz).date() - timedelta(days=1)
+    last_day = from_ms(end_ms).astimezone(tz).date()
+    windows: list[tuple[int, int]] = []
+    day = first_day
+    while day <= last_day:
+        midnight = datetime(day.year, day.month, day.day, tzinfo=tz)
+        lo = to_ms(midnight + timedelta(hours=hour_start))
+        hi = to_ms(midnight + timedelta(hours=hour_end))
+        lo, hi = max(lo, start_ms), min(hi, end_ms)
+        if lo < hi:
+            windows.append((lo, hi))
+        day += timedelta(days=1)
+    return windows
+
+
+def poisson_instants(rng: random.Random, windows: list[tuple[int, int]], rate: float) -> list[int]:
+    """Instants (ms) d'un processus de Poisson d'intensité ``rate`` (par ms) sur les fenêtres."""
+    instants: list[int] = []
+    if rate <= 0:
+        return instants
+    for lo, hi in windows:
+        t = float(lo)
+        while True:
+            t += rng.expovariate(rate)
+            if t >= hi:
+                break
+            instants.append(int(t))
+    return instants
+
+
+def outgoing_type(rng: random.Random, config: GeneratorConfig) -> str:
+    """Type sortant tiré selon le mix du trafic normal."""
+    weights = [config.traffic.type_weights.get(t, 0.0) for t in OUTGOING_TYPES]
+    return rng.choices(OUTGOING_TYPES, weights)[0]
 
 
 def hour_slices(sim_start: datetime, sim_end: datetime) -> list[tuple[int, int]]:
@@ -153,3 +197,138 @@ def generate_slice(
             make_transaction(rng, config, population, client, tx_type, int(t), amount, region)
         )
     return transactions
+
+
+# --- Trafic près des seuils (H10) -------------------------------------------
+
+NEAR_THRESHOLD_KINDS: tuple[str, ...] = (
+    "PRESQUE_RAFALE",
+    "GROS_MONTANT_JOUR",
+    "NUIT_SOUS_SEUIL",
+    "MULTIPLE_MEDIANE",
+)
+
+
+def _presque_rafales(
+    rng: random.Random, config: GeneratorConfig, pop: Population, start_ms: int, end_ms: int
+) -> list[Transaction]:
+    """5 TRANSFER du même client en moins de 2 min : un transfert de plus suffit à R1."""
+    cfg = config.near_threshold
+    max_ms = cfg.presque_rafale_max_duration_s * 1000
+    n = cfg.presque_rafale_transfers
+    windows = [(start_ms, end_ms - max_ms)] if end_ms - max_ms > start_ms else []
+    txs: list[Transaction] = []
+    for t0 in poisson_instants(rng, windows, cfg.presque_rafale_per_day / DAY_MS):
+        client = rng.choice(pop.clients)
+        duration = rng.randint(min(n * 1000, max_ms), max_ms)
+        offsets = sorted([0, duration, *(rng.randint(0, duration) for _ in range(n - 2))])
+        receivers = [c.user_id for c in rng.sample(pop.clients, n + 1) if c is not client][:n]
+        channel = rng.choice(("APP", "USSD"))
+        for offset, receiver in zip(offsets, receivers, strict=True):
+            amount = draw_outgoing_amount(rng, config, client)
+            txs.append(
+                make_transaction(
+                    rng,
+                    config,
+                    pop,
+                    client,
+                    "TRANSFER",
+                    t0 + offset,
+                    amount,
+                    client.home_region,
+                    channel=channel,
+                    receiver_id=receiver,
+                )
+            )
+    return txs
+
+
+def _montants_fixes(
+    rng: random.Random,
+    config: GeneratorConfig,
+    pop: Population,
+    windows: list[tuple[int, int]],
+    rate: float,
+    amount_min: int,
+    amount_max: int,
+) -> list[Transaction]:
+    """Sorties à montant uniforme dans [amount_min ; amount_max], aux instants d'un Poisson."""
+    txs: list[Transaction] = []
+    for t in poisson_instants(rng, windows, rate):
+        client = rng.choice(pop.clients)
+        amount = rng.randint(amount_min, amount_max)
+        tx_type = outgoing_type(rng, config)
+        txs.append(
+            make_transaction(rng, config, pop, client, tx_type, t, amount, client.home_region)
+        )
+    return txs
+
+
+def _multiples_mediane(
+    rng: random.Random, config: GeneratorConfig, pop: Population, start_ms: int, end_ms: int
+) -> list[Transaction]:
+    """Sorties à 6–9 × la médiane de clients éligibles à R2 : sous son facteur 10."""
+    cfg = config.near_threshold
+    eligibles = [c for c in pop.clients if expected_outgoing_30d(config, c) >= 5]
+    txs: list[Transaction] = []
+    for t in poisson_instants(rng, [(start_ms, end_ms)], cfg.multiple_mediane_per_day / DAY_MS):
+        client = rng.choice(eligibles)
+        factor = rng.uniform(cfg.multiple_mediane_factor_min, cfg.multiple_mediane_factor_max)
+        amount = clamp_amount(config, client.median_amount_xof * factor)
+        tx_type = outgoing_type(rng, config)
+        txs.append(
+            make_transaction(rng, config, pop, client, tx_type, t, amount, client.home_region)
+        )
+    return txs
+
+
+def generate_near_threshold(
+    config: GeneratorConfig,
+    population: Population,
+    sim_start: datetime,
+    sim_end: datetime,
+    seed: int,
+) -> list[Transaction]:
+    """Tout le trafic près des seuils du run, trié par ``event_time`` (H10)."""
+    cfg = config.near_threshold
+    start_ms, end_ms = to_ms(sim_start), to_ms(sim_end)
+
+    def rng(kind: str) -> random.Random:
+        return random.Random(f"{seed}:near_threshold:{kind}")
+
+    jour = local_windows(
+        start_ms,
+        end_ms,
+        config.tz,
+        cfg.gros_montant_jour_hour_start,
+        cfg.gros_montant_jour_hour_end,
+    )
+    nuit = local_windows(
+        start_ms, end_ms, config.tz, cfg.nuit_sous_seuil_hour_start, cfg.nuit_sous_seuil_hour_end
+    )
+    heures_jour = cfg.gros_montant_jour_hour_end - cfg.gros_montant_jour_hour_start
+    heures_nuit = cfg.nuit_sous_seuil_hour_end - cfg.nuit_sous_seuil_hour_start
+    txs = [
+        *_presque_rafales(rng("PRESQUE_RAFALE"), config, population, start_ms, end_ms),
+        *_montants_fixes(
+            rng("GROS_MONTANT_JOUR"),
+            config,
+            population,
+            jour,
+            cfg.gros_montant_jour_per_day / (heures_jour * HOUR_MS),
+            cfg.gros_montant_jour_min_xof,
+            cfg.gros_montant_jour_max_xof,
+        ),
+        *_montants_fixes(
+            rng("NUIT_SOUS_SEUIL"),
+            config,
+            population,
+            nuit,
+            cfg.nuit_sous_seuil_per_day / (heures_nuit * HOUR_MS),
+            cfg.nuit_sous_seuil_min_xof,
+            cfg.nuit_sous_seuil_max_xof,
+        ),
+        *_multiples_mediane(rng("MULTIPLE_MEDIANE"), config, population, start_ms, end_ms),
+    ]
+    txs.sort(key=lambda tx: (tx.event_time, str(tx.transaction_id)))
+    return txs

@@ -1,4 +1,7 @@
-"""Épisodes injectés du noyau (§2 du cadrage de la phase 2) : R1, R2, R3.
+"""Épisodes injectés (§2 du cadrage de la phase 2) : R1 à R3, puis R4 et R5.
+
+R4 (cash-out rapide) et R5 (changement de région) sont injectés dès le MVP mais
+ne sont pas détectés : le rappel global reste honnêtement sous 100 %.
 
 Un épisode = une anomalie (``anomaly_id``) et une ou plusieurs transactions. Les
 épisodes sont générés à part du trafic normal (H11), puis fusionnés par temps.
@@ -11,33 +14,36 @@ du type, avec ``per_day`` épisodes en moyenne par jour complet : un run d'une
 heure a donc peu d'épisodes, et aucun de nuit s'il ne couvre pas la nuit.
 
 Les transactions d'épisode ne sont jamais invalides ni très en retard (H12) :
-ces compléments ne s'appliqueront qu'au trafic normal.
+``producer.delivery`` le garantit.
 """
 
 from __future__ import annotations
 
+import math
 import random
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from producer.config import GeneratorConfig
-from producer.events import (
-    EXPECTED_RULE,
-    OUTGOING_TYPES,
-    Transaction,
-    from_ms,
-    to_ms,
-    uuid_from,
-)
+from producer.events import EXPECTED_RULE, Transaction, to_ms, uuid_from
 from producer.profiles import Client, Population, expected_outgoing_30d
-from producer.traffic import HOUR_MS, draw_outgoing_amount, make_transaction
+from producer.traffic import (
+    HOUR_MS,
+    draw_cash_in_amount,
+    draw_outgoing_amount,
+    local_windows,
+    make_transaction,
+    outgoing_type,
+    poisson_instants,
+)
 
 DAY_MS = 24 * HOUR_MS
 
-# Types du noyau, dans un ordre fixe (R4 et R5 : compléments de fin de phase)
+# Types du noyau (R1 à R3) puis compléments (R4, R5). Chaque type a son flux
+# aléatoire : ajouter R4 et R5 n'a changé aucun épisode R1 à R3 d'une même graine.
 CORE_TYPES: tuple[str, ...] = ("RAFALE", "MONTANT_ANORMAL", "NUIT_GROS_MONTANT")
+EPISODE_TYPES: tuple[str, ...] = (*CORE_TYPES, "CASH_OUT_RAPIDE", "CHANGEMENT_REGION")
 
 # Nombre maximal de clients essayés pour un MONTANT_ANORMAL sous le plafond
 _MAX_ESSAIS = 1_000
@@ -54,50 +60,9 @@ class Episode:
         return EXPECTED_RULE[self.anomaly_type]
 
 
-# --- Fenêtres horaires et processus de Poisson ------------------------------
-
-
-def local_windows(
-    start_ms: int, end_ms: int, tz: ZoneInfo, hour_start: int, hour_end: int
-) -> list[tuple[int, int]]:
-    """Plages [hour_start ; hour_end[ en heure locale, intersectées avec [start ; end[ (ms)."""
-    first_day = from_ms(start_ms).astimezone(tz).date() - timedelta(days=1)
-    last_day = from_ms(end_ms).astimezone(tz).date()
-    windows: list[tuple[int, int]] = []
-    day = first_day
-    while day <= last_day:
-        midnight = datetime(day.year, day.month, day.day, tzinfo=tz)
-        lo = to_ms(midnight + timedelta(hours=hour_start))
-        hi = to_ms(midnight + timedelta(hours=hour_end))
-        lo, hi = max(lo, start_ms), min(hi, end_ms)
-        if lo < hi:
-            windows.append((lo, hi))
-        day += timedelta(days=1)
-    return windows
-
-
-def poisson_instants(rng: random.Random, windows: list[tuple[int, int]], rate: float) -> list[int]:
-    """Instants (ms) d'un processus de Poisson d'intensité ``rate`` (par ms) sur les fenêtres."""
-    instants: list[int] = []
-    if rate <= 0:
-        return instants
-    for lo, hi in windows:
-        t = float(lo)
-        while True:
-            t += rng.expovariate(rate)
-            if t >= hi:
-                break
-            instants.append(int(t))
-    return instants
-
-
-def _outgoing_type(rng: random.Random, config: GeneratorConfig) -> str:
-    """Type sortant tiré selon le mix du trafic normal."""
-    weights = [config.traffic.type_weights.get(t, 0.0) for t in OUTGOING_TYPES]
-    return rng.choices(OUTGOING_TYPES, weights)[0]
-
-
 # --- Construction par type --------------------------------------------------
+# (fenêtres horaires et processus de Poisson : producer.traffic, partagés avec
+# le trafic près des seuils)
 
 
 def _rafales(
@@ -158,7 +123,7 @@ def _montants_anormaux(
         else:
             raise RuntimeError("MONTANT_ANORMAL : aucun client sous le plafond de montant")
         tx = make_transaction(
-            rng, config, pop, client, _outgoing_type(rng, config), t, amount, client.home_region
+            rng, config, pop, client, outgoing_type(rng, config), t, amount, client.home_region
         )
         episodes.append(Episode(uuid_from(rng), "MONTANT_ANORMAL", (tx,)))
     return episodes
@@ -176,9 +141,67 @@ def _nuits_gros_montant(
         client = rng.choice(pop.clients)
         amount = rng.randint(cfg.amount_min_xof, cfg.amount_max_xof)
         tx = make_transaction(
-            rng, config, pop, client, _outgoing_type(rng, config), t, amount, client.home_region
+            rng, config, pop, client, outgoing_type(rng, config), t, amount, client.home_region
         )
         episodes.append(Episode(uuid_from(rng), "NUIT_GROS_MONTANT", (tx,)))
+    return episodes
+
+
+def _cash_outs_rapides(
+    rng: random.Random, config: GeneratorConfig, pop: Population, start_ms: int, end_ms: int
+) -> list[Episode]:
+    """CASH_OUT_RAPIDE → R4 : CASH_IN de X, puis CASH_OUT d'au moins 90 % de X en 1 à 9 min.
+
+    Les deux opérations ont lieu chez des agents de la même région (celle du
+    client) ; le montant de sortie est arrondi vers le haut pour rester ≥ 90 % de X.
+    """
+    cfg = config.episodes.cash_out_rapide
+    max_ms = cfg.delay_max_s * 1000
+    windows = [(start_ms, end_ms - max_ms)] if end_ms - max_ms > start_ms else []
+    episodes: list[Episode] = []
+    for t in poisson_instants(rng, windows, cfg.per_day / DAY_MS):
+        client = rng.choice(pop.clients)
+        region = client.home_region
+        x = draw_cash_in_amount(rng, config, client)
+        ratio = rng.uniform(cfg.out_ratio_min, cfg.out_ratio_max)
+        # ≥ 90 % de X, ≤ X, et jamais sous le minimum du schéma (X = 100 → 90 serait invalide)
+        plancher = max(math.ceil(cfg.out_ratio_min * x), config.amounts.min_xof)
+        sortie = min(x, max(plancher, round(ratio * x)))
+        delai = rng.randint(cfg.delay_min_s * 1000, max_ms)
+        cash_in = make_transaction(rng, config, pop, client, "CASH_IN", t, x, region)
+        cash_out = make_transaction(rng, config, pop, client, "CASH_OUT", t + delai, sortie, region)
+        episodes.append(Episode(uuid_from(rng), "CASH_OUT_RAPIDE", (cash_in, cash_out)))
+    return episodes
+
+
+def _changements_region(
+    rng: random.Random, config: GeneratorConfig, pop: Population, start_ms: int, end_ms: int
+) -> list[Episode]:
+    """CHANGEMENT_REGION → R5 : 2 sorties du même client dans 2 régions éloignées, < 15 min."""
+    cfg = config.episodes.changement_region
+    max_ms = cfg.delay_max_s * 1000
+    windows = [(start_ms, end_ms - max_ms)] if end_ms - max_ms > start_ms else []
+    episodes: list[Episode] = []
+    for t in poisson_instants(rng, windows, cfg.per_day / DAY_MS):
+        client = rng.choice(pop.clients)
+        premiere, seconde = rng.choice(cfg.far_pairs)
+        if rng.random() < 0.5:  # sens du trajet tiré au hasard
+            premiere, seconde = seconde, premiere
+        delai = rng.randint(cfg.delay_min_s * 1000, max_ms)
+        txs = tuple(
+            make_transaction(
+                rng,
+                config,
+                pop,
+                client,
+                outgoing_type(rng, config),
+                instant,
+                draw_outgoing_amount(rng, config, client),
+                region,
+            )
+            for instant, region in ((t, premiere), (t + delai, seconde))
+        )
+        episodes.append(Episode(uuid_from(rng), "CHANGEMENT_REGION", txs))
     return episodes
 
 
@@ -189,15 +212,17 @@ def generate_episodes(
     sim_end: datetime,
     seed: int,
 ) -> list[Episode]:
-    """Tous les épisodes du noyau sur [sim_start ; sim_end[, triés par première transaction."""
+    """Tous les épisodes sur [sim_start ; sim_end[, triés par première transaction."""
     start_ms, end_ms = to_ms(sim_start), to_ms(sim_end)
     builders = {
         "RAFALE": _rafales,
         "MONTANT_ANORMAL": _montants_anormaux,
         "NUIT_GROS_MONTANT": _nuits_gros_montant,
+        "CASH_OUT_RAPIDE": _cash_outs_rapides,
+        "CHANGEMENT_REGION": _changements_region,
     }
     episodes: list[Episode] = []
-    for anomaly_type in CORE_TYPES:
+    for anomaly_type in EPISODE_TYPES:
         rng = random.Random(f"{seed}:episodes:{anomaly_type}")
         episodes.extend(builders[anomaly_type](rng, config, population, start_ms, end_ms))
     episodes.sort(key=lambda e: (e.transactions[0].event_time, str(e.anomaly_id)))

@@ -39,12 +39,13 @@ import psycopg
 from confluent_kafka import KafkaError, Message, Producer
 from psycopg.types.json import Jsonb
 
-from producer.anomalies import CORE_TYPES, Episode, generate_episodes
+from producer.anomalies import EPISODE_TYPES, Episode, generate_episodes
 from producer.clock import SimClock, check_range, parse_duration
 from producer.config import DEFAULT_CONFIG_PATH, ConfigError, GeneratorConfig, load_config
+from producer.delivery import INVALID_REASONS, Delivery, DeliveryCounters
 from producer.events import Emission, Transaction, Truth, format_event_time, to_ms
 from producer.profiles import Population, bootstrap_profiles, build_population
-from producer.traffic import generate_slice, hour_slices
+from producer.traffic import generate_near_threshold, generate_slice, hour_slices
 
 TOPIC = "transactions"
 
@@ -142,21 +143,30 @@ class Plan:
     sim_end: datetime
     population: Population
     episodes: list[Episode]
-    # Transactions d'épisode, rangées par indice de tranche horaire
-    _episode_txs: dict[int, list[tuple[Transaction, Truth]]] = field(default_factory=dict)
+    # Transactions d'épisode et trafic près des seuils (sans vérité terrain),
+    # rangés par indice de tranche horaire
+    _episode_txs: dict[int, list[tuple[Transaction, Truth | None]]] = field(default_factory=dict)
+    # Compteurs de retards et d'invalides du dernier parcours de slices()
+    counters: DeliveryCounters = field(default_factory=DeliveryCounters)
 
     @property
     def episodes_by_type(self) -> dict[str, int]:
         """Nombre d'épisodes par type, y compris les types à 0 (``nb_episodes``)."""
         counts = Counter(e.anomaly_type for e in self.episodes)
-        return {t: counts.get(t, 0) for t in CORE_TYPES}
+        return {t: counts.get(t, 0) for t in EPISODE_TYPES}
 
     def slices(self) -> Iterator[list[Emission]]:
         """Émissions tranche horaire par tranche horaire, triées par ``emit_sim_time`` (H2).
 
-        Le tri secondaire sur ``transaction_id`` rend l'ordre total, donc stable.
+        Dans une tranche, les transactions sont triées par (``event_time``,
+        ``transaction_id``) : ordre total, donc stable. ``Delivery`` décide des
+        retards et des invalides, et ne rend que les émissions antérieures à la fin
+        de la tranche. Les retardataires postérieurs à ``sim_end`` forment la
+        dernière liste. ``self.counters`` est rempli au fil du parcours.
         """
         rng = random.Random(f"{self.seed}:trafic")
+        delivery = Delivery(self.config, self.seed)
+        self.counters = delivery.counters
         for index, (start_ms, end_ms) in enumerate(hour_slices(self.sim_start, self.sim_end)):
             items: list[tuple[Transaction, Truth | None]] = [
                 (tx, None)
@@ -164,23 +174,18 @@ class Plan:
             ]
             items.extend(self._episode_txs.get(index, []))
             items.sort(key=lambda item: (item[0].event_time, str(item[0].transaction_id)))
-            yield [
-                Emission(
-                    emit_sim_time=tx.event_time,  # noyau : pas de retard d'émission (H14)
-                    key=tx.sender_id,
-                    value=tx.to_json(),
-                    transaction=tx,
-                    truth=truth,
-                )
-                for tx, truth in items
-            ]
+            for tx, truth in items:
+                delivery.push(tx, truth)
+            yield delivery.pop_before(end_ms)
+        yield delivery.drain()
 
 
 def plan_run(config: GeneratorConfig, seed: int, sim_start: datetime, sim_end: datetime) -> Plan:
     """Prépare le run : population, épisodes et leur répartition par tranche horaire."""
     population = build_population(config, seed)
     episodes = generate_episodes(config, population, sim_start, sim_end, seed)
-    return plan_from_episodes(config, seed, sim_start, sim_end, population, episodes)
+    near = generate_near_threshold(config, population, sim_start, sim_end, seed)
+    return plan_from_episodes(config, seed, sim_start, sim_end, population, episodes, near)
 
 
 def plan_from_episodes(
@@ -190,20 +195,28 @@ def plan_from_episodes(
     sim_end: datetime,
     population: Population,
     episodes: list[Episode],
+    near_threshold: Sequence[Transaction] = (),
 ) -> Plan:
-    """Range chaque transaction d'épisode dans la tranche horaire de **son** ``event_time``.
+    """Range chaque transaction pré-calculée dans la tranche horaire de **son** ``event_time``.
 
     Un épisode n'est donc pas lié à une tranche : une rafale commencée à hh:59:30
     déborde sur la tranche suivante, et sa vérité terrain est écrite tranche par
-    tranche, juste avant l'envoi des transactions concernées (H13).
+    tranche, juste avant l'envoi des transactions concernées (H13). Le trafic près
+    des seuils (H10) est rangé de la même façon, sans vérité terrain.
     """
     plan = Plan(config, seed, sim_start, sim_end, population, episodes)
     starts = [start for start, _ in hour_slices(sim_start, sim_end)]
+
+    def ranger(tx: Transaction, truth: Truth | None) -> None:
+        index = bisect_right(starts, to_ms(tx.event_time)) - 1
+        plan._episode_txs.setdefault(index, []).append((tx, truth))
+
     for episode in episodes:
         truth = Truth(episode.anomaly_id, episode.anomaly_type, episode.expected_rule)
         for tx in episode.transactions:
-            index = bisect_right(starts, to_ms(tx.event_time)) - 1
-            plan._episode_txs.setdefault(index, []).append((tx, truth))
+            ranger(tx, truth)
+    for tx in near_threshold:
+        ranger(tx, None)
     return plan
 
 
@@ -227,11 +240,20 @@ def run_params(config: GeneratorConfig, options: RunOptions) -> dict[str, Any]:
 class RunStats:
     nb_sent: int = 0
     nb_episodes: dict[str, int] = field(default_factory=dict)
-    # Compléments de fin de phase (H14, H15) : toujours 0 dans le noyau
+    # Retards (H14) et invalides (H15), recopiés des compteurs de Delivery
     nb_late: int = 0
     nb_very_late: int = 0
     nb_invalid: int = 0
     nb_invalid_by_reason: dict[str, int] = field(default_factory=dict)
+
+    def take_counters(self, counters: DeliveryCounters) -> None:
+        """Recopie les compteurs de livraison, motifs à 0 compris."""
+        self.nb_late = counters.nb_late
+        self.nb_very_late = counters.nb_very_late
+        self.nb_invalid = counters.nb_invalid
+        self.nb_invalid_by_reason = {
+            r: counters.nb_invalid_by_reason.get(r, 0) for r in INVALID_REASONS
+        }
 
 
 def write_dry_run(plan: Plan, out: Path) -> tuple[RunStats, str]:
@@ -246,6 +268,7 @@ def write_dry_run(plan: Plan, out: Path) -> tuple[RunStats, str]:
                 fichier.write(line)
                 digest.update(line.encode("utf-8"))
                 stats.nb_sent += 1
+    stats.take_counters(plan.counters)
     return stats, digest.hexdigest()
 
 
@@ -288,8 +311,8 @@ class DeliveryTracker:
             self.delivered += 1
 
 
-def _produce(producer: Producer, emission: Emission, tracker: DeliveryTracker) -> None:
-    """Envoie une émission ; si la file locale est pleine, la vide puis réessaie.
+def _produce(producer: Producer, key: str, value: str, tracker: DeliveryTracker) -> None:
+    """Envoie un message ; si la file locale est pleine, la vide puis réessaie.
 
     L'horodatage du message n'est pas passé : le client le pose à l'envoi
     (CreateTime, temps réel), c'est ``ingested_at`` (F10).
@@ -298,8 +321,8 @@ def _produce(producer: Producer, emission: Emission, tracker: DeliveryTracker) -
         try:
             producer.produce(
                 TOPIC,
-                key=emission.key.encode("utf-8"),
-                value=emission.value.encode("utf-8"),
+                key=key.encode("utf-8"),
+                value=value.encode("utf-8"),
                 on_delivery=tracker,
             )
             return
@@ -408,15 +431,19 @@ def run_live(
                 db.commit()
             for emission in emissions:
                 _wait_until(clock.real_deadline(emission.emit_sim_time), now, sleep, producer)
-                # Invariant F7 : jamais d'événement dans le futur réel
-                if emission.transaction.event_time > now():
+                reel = now()
+                # Invariant F7 : jamais d'événement dans le futur réel (le motif
+                # EVENT_TIME_FUTUR est volontaire : seule la transaction d'origine compte)
+                if emission.transaction.event_time > reel:
                     raise RunError("event_time dans le futur réel : horloge simulée en avance")
-                _produce(producer, emission, tracker)
+                # Motif EVENT_TIME_FUTUR : valeur calculée à l'envoi, horloge injectée (H15)
+                _produce(producer, emission.key, emission.render(reel), tracker)
                 stats.nb_sent += 1
                 producer.poll(0)
             if tracker.errors:
                 break
 
+        stats.take_counters(plan.counters)
         restants = producer.flush(FLUSH_TIMEOUT_S)
         if tracker.errors or restants or tracker.delivered != stats.nb_sent:
             raise RunError(

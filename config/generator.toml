@@ -69,3 +69,67 @@ amount_min_xof = 500_001
 amount_max_xof = 2_000_000
 hour_start = 1                   # heure locale, [01:00 ; 05:00[
 hour_end = 5
+
+[episodes.cash_out_rapide]       # → R4 (injecté, non détecté au MVP)
+per_day = 20
+# CASH_IN de X puis CASH_OUT de U(min ; max) × X, chez des agents de la même région
+out_ratio_min = 0.90
+out_ratio_max = 1.00
+delay_min_s = 60                 # entre 1 et 9 min (< 10 min)
+delay_max_s = 540
+
+[episodes.changement_region]     # → R5 (injecté, non détecté au MVP)
+per_day = 20
+delay_min_s = 60                 # deux sorties à moins de 15 min d'écart
+delay_max_s = 840
+# Paires de régions « éloignées » (illustratives)
+far_pairs = [
+    ["Ziguinchor", "Dakar"],
+    ["Ziguinchor", "Thiès"],
+    ["Ziguinchor", "Diourbel"],
+    ["Ziguinchor", "Saint-Louis"],
+    ["Ziguinchor", "Kaolack"],
+    ["Saint-Louis", "Kaolack"],
+]
+
+# Trafic près des seuils (H10) : trafic NORMAL, absent de la vérité terrain.
+# Il rend les faux positifs possibles (PRD §7.2). Nombre moyen par jour simulé.
+[near_threshold]
+# 5 TRANSFER du même client en moins de 2 min : 1 transfert ordinaire de plus → 6
+presque_rafale_per_day = 20
+presque_rafale_transfers = 5
+presque_rafale_max_duration_s = 110
+# Gros montants de jour (> 500 000) : seuil de R3 franchi, mais hors de la nuit
+gros_montant_jour_per_day = 15
+gros_montant_jour_min_xof = 500_001
+gros_montant_jour_max_xof = 2_000_000
+gros_montant_jour_hour_start = 6
+gros_montant_jour_hour_end = 23
+# Montants de nuit juste sous le seuil de R3
+nuit_sous_seuil_per_day = 15
+nuit_sous_seuil_min_xof = 400_000
+nuit_sous_seuil_max_xof = 500_000
+nuit_sous_seuil_hour_start = 1
+nuit_sous_seuil_hour_end = 5
+# Sorties à 6–9 × la médiane du client : sous le facteur 10 de R2
+multiple_mediane_per_day = 30
+multiple_mediane_factor_min = 6.0
+multiple_mediane_factor_max = 9.0
+
+# Retards d'émission (H14) : le message part après d'autres plus récents ;
+# event_time n'est pas modifié. Parts des messages envoyés.
+[delays]
+late_share = 0.05
+late_min_s = 10
+late_max_s = 300
+very_late_share = 0.002          # jamais sur une transaction d'épisode (H12)
+very_late_min_s = 900
+very_late_max_s = 1_800
+
+# Messages invalides (H15) : une transaction normale remplacée par une version
+# corrompue (la version valide n'est pas envoyée). Jamais sur un épisode.
+[invalid]
+share = 0.005
+# Motif EVENT_TIME_FUTUR : event_time = heure réelle d'envoi + U(min ; max)
+future_offset_min_s = 360        # au-delà de la tolérance de 5 min du schéma
+future_offset_max_s = 3_600

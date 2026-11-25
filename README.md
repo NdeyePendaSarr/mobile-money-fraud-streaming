@@ -52,7 +52,7 @@ ensemble : `streaming` (Kafka, PostgreSQL, puis générateur, Spark, Grafana) et
 |---|---|:---:|
 | 0 | Cadrage : schéma de l'événement, règles, mesure de la détection | ✅ |
 | 1 | Socle : Kafka KRaft, PostgreSQL, topics, tables, versions figées, mémoire mesurée | ✅ |
-| 2 | Générateur : horloge simulée, anomalies injectées, vérité terrain | — |
+| 2 | Générateur : horloge simulée, anomalies injectées, vérité terrain, retards, messages invalides | ✅ |
 | 3 | Premier consommateur Spark : lecture, validation, écriture en base | — |
 | 4 | Règles sans état : montant anormal, gros montant de nuit | — |
 | 5 | Fenêtres : rafale, indicateurs par minute, watermark | — |
@@ -65,13 +65,77 @@ ensemble : `streaming` (Kafka, PostgreSQL, puis générateur, Spark, Grafana) et
 
 | Élément | Détail |
 |---|---|
-| Kafka 4.3.2 | KRaft, un nœud (broker et contrôleur), tas de 512 Mo, création automatique des topics désactivée ; listeners `kafka:29092` (conteneurs) et `localhost:9092` (hôte) |
+| Kafka 4.3.2 | KRaft, un nœud (broker et contrôleur), tas de 512 Mo, création automatique des topics désactivée ; listeners `kafka:29092` (conteneurs) et `127.0.0.1:9092` (hôte) |
 | Topics | `transactions` : 3 partitions, rétention 7 jours ; `dead_letter` : 1 partition, 7 jours ; créés par le conteneur ponctuel `kafka-init` (rejouable) |
 | PostgreSQL 17.12 | port hôte **5434** (5432 = PostgreSQL local, 5433 = projet 1), volume nommé ; les 8 tables du projet créées par [`sql/init.sql`](sql/init.sql), avec les contraintes du schéma de l'événement |
 | Contrôle | `make check` : lint, types (mypy strict), tests, puis [`scripts/check_infra.py`](scripts/check_infra.py) (ports publiés, topics, partitions, rétention, tables) |
 | Sécurité locale | ports publiés sur `127.0.0.1` seulement ; variables préfixées `SENPAY_`, et `make` refuse de démarrer si une variable `SENPAY_*` ou `POSTGRES_*` est exportée dans le shell (elle écraserait `.env`) |
 | Versions | figées dans [docs/versions.md](docs/versions.md), dont Spark 4.2.1, son connecteur Kafka et le pilote JDBC |
 | Choix | justifiés dans [docs/choix-techniques.md](docs/choix-techniques.md) |
+
+## Générateur (phase 2)
+
+Le générateur produit un flux de transactions **fictives**, reproductible, avec des anomalies
+injectées dont la liste (la vérité terrain) est écrite à part en base, jamais dans le message
+Kafka. Il tourne sur l'hôte et envoie vers `127.0.0.1:9092`.
+
+```bash
+make generate ARGS="--seed 42 --start 2026-11-23T00:00:00Z --duration 1d --speed max --init-profiles"
+```
+
+| Option | Rôle |
+|---|---|
+| `--seed` | graine : même graine + mêmes paramètres = mêmes transactions |
+| `--start`, `--duration` | plage simulée (`30min`, `2h`, `1d`, `30d`) ; refusée si elle finit dans le futur réel, ou si elle commence avant la fin du dernier run (`make reset` pour rejouer) |
+| `--speed` | facteur de vitesse (`60` : 1 jour simulé en 24 min ; 10 min simulées durent 10 s) ou `max` (sans attente) |
+| `--init-profiles` | écrit les 10 000 profils d'amorçage (`user_profiles`, source `GENERATEUR`) |
+| `--dry-run --out run.jsonl` | sans Kafka ni base : écrit les émissions dans un fichier ; deux fichiers de même graine ont le même sha256 |
+
+Paramètres (volumes, lois, taux) : [`config/generator.toml`](config/generator.toml), valeurs
+illustratives. Les seuils des règles de détection n'y sont pas : générateur et règles sont
+indépendants.
+
+**Contenu d'un run** (graine 42, journée simulée du 23/11/2026, `--speed max`, 25/11/2026) :
+
+| Mesure | Valeur |
+|---|---|
+| Messages envoyés (`nb_sent`) | **30 530** = somme des offsets de fin du topic (9 627 + 10 323 + 10 580) |
+| Épisodes injectés | rafale 12 (95 transactions), montant anormal 45, nuit + gros montant 26, cash-out rapide 13 (26), changement de région 22 (44) ; chaque type → sa règle attendue (R1 à R5) |
+| Messages en retard | 1 571 (5,15 %) de 10 s à 5 min ; 56 (0,18 %) de 15 à 30 min |
+| Messages invalides | 135 (0,44 %), 8 motifs : JSON illisible, champ manquant, `schema_version` = 2, type inconnu, montant hors bornes, canal incohérent, destinataire = émetteur, `event_time` dans le futur |
+| Profils d'amorçage | 10 000 |
+| Durée | 1,7 s (≈ 18 000 msg/s, sans attente : mesure du générateur sur ce poste, pas du pipeline) |
+
+- R4 et R5 sont **injectés mais pas détectés** au MVP : le rappel global restera sous 100 %.
+- Une transaction d'épisode n'est jamais invalide ni très en retard : une non-détection doit
+  venir de la règle, pas du générateur.
+- Du trafic normal est généré **près des seuils** (presque-rafales de 5 transferts, gros montants
+  de jour, montants de nuit juste sous 500 000, sorties à 6–9 × la médiane) pour que des faux
+  positifs restent possibles.
+
+Un message réel du topic (clé = `sender_id`, valeur = JSON v1) :
+
+```bash
+docker compose --env-file .env --profile streaming exec kafka \
+  /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:29092 \
+  --topic transactions --partition 0 --offset 0 --max-messages 1 \
+  --formatter-property print.key=true --formatter-property key.separator=" | "
+```
+
+```
+U-000112 | {"schema_version":1,"transaction_id":"5e1439b7-193b-4a80-b5e5-c4c1e508166b","event_time":"2026-11-23T00:01:20.814Z","sender_id":"U-000112","receiver_id":"U-005719","type":"TRANSFER","amount_xof":1344,"region":"Diourbel","channel":"APP","agent_id":null}
+```
+
+**Limites du générateur**
+
+- Données **100 % fictives** ; lois et taux illustratifs, pas des statistiques d'opérateur.
+- **Circularité** : le générateur et les règles sont conçus par la même personne ; les mesures
+  de détection montreront la cohérence du système, pas son efficacité sur de vraies fraudes.
+- Profils d'amorçage calculés depuis les paramètres du générateur (médiane exacte de la loi de
+  chaque client) : ils jouent l'historique d'un ancien système, jusqu'au premier batch.
+- Pas de messages en double (producteur idempotent) ; pas de dédoublonnage à tester au MVP.
+- Le motif « `event_time` dans le futur » dépend de l'heure réelle d'envoi : le `--dry-run`
+  enregistre le décalage, pas la valeur.
 
 ## Lancer le projet
 
@@ -85,6 +149,8 @@ cp .env.example .env   # puis choisis un mot de passe dans .env
 make install           # environnement Python 3.12
 make up                # profil streaming : Kafka, création des topics, PostgreSQL
 make check             # lint, types, tests, topics et tables
+make generate ARGS="--seed 42 --start 2026-11-23T00:00:00Z --duration 1d --speed max --init-profiles"
+make test-integration  # run réel d'une heure simulée (écrit en base)
 make topics            # liste et décrit les topics
 make stats             # mémoire des conteneurs
 make down              # arrêt, données conservées
