@@ -53,14 +53,17 @@ def _end_offsets_total() -> int:
         consumer.close()
 
 
-def test_run_d_une_heure_en_speed_max() -> None:
+def test_run_d_une_heure_en_speed_max(capsys: pytest.CaptureFixture[str]) -> None:
     reel = datetime.now(UTC)  # heure réelle injectée, comme au point d'entrée
     with _connect() as db:
         row = db.execute(
-            "select max(sim_end), count(*) filter (where ended_at is null) from generator_runs"
+            "select max(sim_end), count(*) filter (where ended_at is null), "
+            "coalesce(max(seed), 4241) from generator_runs"
         ).fetchone()
     assert row is not None
-    dernier, inacheves = row
+    dernier, inacheves, graine_max = row
+    # Une graine encore libre : le générateur refuse une graine déjà en base
+    graine = str(max(int(graine_max), 4241) + 1)
     if inacheves:
         pytest.skip("run inachevé en base : make reset")
     # Plage d'une heure, après le dernier run et au moins 1 h dans le passé
@@ -74,7 +77,7 @@ def test_run_d_une_heure_en_speed_max() -> None:
     code = main(
         [
             "--seed",
-            "4242",
+            graine,
             "--start",
             format_event_time(debut),
             "--duration",
@@ -107,3 +110,16 @@ def test_run_d_une_heure_en_speed_max() -> None:
     assert nb_sent > 0
     assert apres - avant == nb_sent
     assert par_type == {t: n for t, n in nb_episodes.items() if n > 0}
+
+    # Même graine, plage suivante : refusé avant tout envoi, aucun run ajouté
+    capsys.readouterr()
+    code = main(
+        ["--seed", graine, "--start", format_event_time(sim_end), "--duration", "1min"],
+        now=lambda: datetime.now(UTC),
+    )
+    assert code == 1
+    assert "déjà utilisée" in capsys.readouterr().out
+    with _connect() as db:
+        total = db.execute("select count(*), max(run_id) from generator_runs").fetchone()
+    assert total is not None and total[1] == run_id
+    assert _end_offsets_total() == apres

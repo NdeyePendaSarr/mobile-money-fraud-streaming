@@ -64,8 +64,9 @@ def test_retention_illisible_ou_differente() -> None:
     assert all("retention.ms" in ecart for ecart in ecarts)
 
 
-def test_huit_tables_attendues() -> None:
-    assert len(TABLES_ATTENDUES) == 8
+def test_dix_tables_attendues() -> None:
+    # 8 tables du PRD §6.2 + transactions_staging et stream_batches (phase 3)
+    assert len(TABLES_ATTENDUES) == 10
 
 
 def test_tables_presentes_et_supplementaires() -> None:

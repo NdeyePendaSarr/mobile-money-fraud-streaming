@@ -279,6 +279,20 @@ class RunError(RuntimeError):
     """Run en échec : il reste sans ``ended_at`` et inutilisable (H13)."""
 
 
+def check_seed_unused(seed: int, existing_run_id: int | None) -> None:
+    """Refuse une graine déjà utilisée par un run en base.
+
+    Les ``transaction_id`` sont tirés du flux « trafic » de la graine depuis son
+    début : deux runs de même graine donneraient les mêmes identifiants, et le
+    consommateur écarterait les seconds comme déjà présents, sans erreur.
+    """
+    if existing_run_id is not None:
+        raise RunError(
+            f"graine {seed} déjà utilisée par le run {existing_run_id} : ses transaction_id "
+            "se répéteraient ; faire make reset (ou choisir une autre graine)"
+        )
+
+
 def _env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -359,6 +373,11 @@ def run_live(
         ).fetchone()
         if inacheves is not None and inacheves[0] > 0:
             raise RunError("un run précédent est inachevé (ended_at vide) : faire make reset")
+        # Une graine ne sert qu'une fois par base (identifiants reproductibles)
+        row = db.execute(
+            "select min(run_id) from generator_runs where seed = %s", (options.seed,)
+        ).fetchone()
+        check_seed_unused(options.seed, row[0] if row is not None else None)
         row = db.execute("select max(sim_end) from generator_runs").fetchone()
         last_sim_end: datetime | None = row[0] if row is not None else None
         try:

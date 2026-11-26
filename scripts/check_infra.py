@@ -5,7 +5,8 @@ Contrôles :
   (celui de ``.env``), et nulle part ailleurs ;
 - les topics ``transactions`` et ``dead_letter`` existent, avec le bon nombre de
   partitions, un facteur de réplication de 1 et une rétention de 7 jours ;
-- les 8 tables du PRD §6.2 existent dans le schéma ``public`` de SENPAY_PG_DB ;
+- les 8 tables du PRD §6.2, plus ``transactions_staging`` et ``stream_batches``
+  (phase 3), existent dans le schéma ``public`` de SENPAY_PG_DB ;
 - un UPDATE de ``alerts.detected_at`` échoue (essai dans une transaction annulée).
 
 Paramètres lus dans l'environnement (``make check`` charge ``.env``) :
@@ -91,6 +92,9 @@ TABLES_ATTENDUES: frozenset[str] = frozenset(
         "generator_runs",
         "daily_kpi",
         "detection_report",
+        # Phase 3 : transit du consommateur et bilan par micro-batch (ajout au PRD §6.2)
+        "transactions_staging",
+        "stream_batches",
     }
 )
 
@@ -387,7 +391,8 @@ def main() -> int:
     if ecarts or ecarts_ports:
         return 1
     print(
-        "OK : ports publiés sur 127.0.0.1, 2 topics conformes, 8 tables présentes, "
+        f"OK : ports publiés sur 127.0.0.1, 2 topics conformes, {len(TABLES_ATTENDUES)} tables "
+        "présentes, "
         "detected_at immuable"
     )
     return 0

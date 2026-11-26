@@ -13,6 +13,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=1.18",
+    "pyspark==4.2.1",
     "pytest>=8.4",
     "ruff>=0.14",
 ]
@@ -23,6 +24,9 @@ package = false
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Le code du job tourne dans l'image Spark, en Python 3.10 (pas ses tests, lancés
+# sur l'hôte en 3.12) ; mypy le vérifie aussi en 3.10 (make typecheck)
+per-file-target-version = { "streaming/*.py" = "py310" }
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
@@ -32,7 +36,7 @@ allowed-confusables = ["×", "−", "–"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["scripts", "tests", "producer"]
+files = ["scripts", "tests", "producer", "streaming"]
 
 # confluent_kafka.admin réexporte ConfigResource, ResourceType… sans __all__ :
 # on autorise la réexportation implicite pour ce seul module.
@@ -41,7 +45,7 @@ module = ["confluent_kafka.admin"]
 implicit_reexport = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "producer/tests"]
+testpaths = ["tests", "producer/tests", "streaming/tests"]
 pythonpath = ["."]
 markers = [
     "integration: exige Kafka et PostgreSQL démarrés (make up) ; écrit un run en base",

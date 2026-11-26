@@ -48,6 +48,52 @@ create table transactions (
 create index transactions_sender_event_idx on transactions (sender_id, event_time);
 
 -- ---------------------------------------------------------------------------
+-- transactions_staging : zone de transit d'un micro-batch (phase 3, I4).
+-- Spark y écrit en JDBC (append), puis le driver fusionne dans transactions en
+-- une transaction : INSERT … ON CONFLICT (transaction_id) DO NOTHING, puis
+-- suppression du lot. Colonnes en text : le typage (uuid…) se fait à la fusion.
+-- Pas de contrainte : les CHECK restent sur transactions (dernier filet).
+-- ---------------------------------------------------------------------------
+create table transactions_staging (
+    batch_id        bigint      not null,
+    transaction_id  text        not null,
+    schema_version  smallint    not null,
+    event_time      timestamptz not null,
+    sender_id       text        not null,
+    receiver_id     text,
+    type            text        not null,
+    amount_xof      bigint      not null,
+    region          text        not null,
+    channel         text        not null,
+    agent_id        text,
+    ingested_at     timestamptz not null,
+    kafka_partition integer     not null,
+    kafka_offset    bigint      not null
+);
+
+create index transactions_staging_batch_idx on transactions_staging (batch_id);
+
+-- ---------------------------------------------------------------------------
+-- stream_batches : bilan de chaque micro-batch du consommateur (phase 3, I5).
+-- AJOUT au PRD §6.2 : compte durable des messages lus, valides, insérés et
+-- invalides par motif, fait par le consommateur (comparable au générateur).
+-- Écrit une seule fois (ON CONFLICT (batch_id) DO NOTHING), dans la même
+-- transaction que la fusion : un micro-batch rejoué garde son bilan d'origine.
+-- ---------------------------------------------------------------------------
+create table stream_batches (
+    batch_id             bigint      primary key check (batch_id >= 0),
+    nb_lus               integer     not null check (nb_lus >= 0),
+    nb_valides           integer     not null check (nb_valides >= 0),
+    nb_inseres           integer     not null check (nb_inseres >= 0),
+    nb_invalides         integer     not null check (nb_invalides >= 0),
+    nb_invalid_by_reason jsonb       not null default '{}'
+        check (jsonb_typeof(nb_invalid_by_reason) = 'object'),
+    processed_at         timestamptz not null default now(),
+    check (nb_lus = nb_valides + nb_invalides),
+    check (nb_inseres <= nb_valides)
+);
+
+-- ---------------------------------------------------------------------------
 -- kpi_minute : fenêtres fixes de 1 min sur event_time (streaming, phase 5, F18)
 -- Upsert sur la clé ; pas de nb_alertes (le dashboard lit alerts).
 -- ---------------------------------------------------------------------------

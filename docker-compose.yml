@@ -103,6 +103,56 @@ services:
       timeout: 5s
       retries: 10
 
+  spark-streaming:
+    # Job Spark Structured Streaming (phase 3, I1). Lancé à part (make stream),
+    # pas par make up : le run A démarre le job après coup, sur un arriéré.
+    build: streaming/
+    image: senpay-spark-streaming:4.2.1
+    profiles: ["streaming"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    # Limite du conteneur (I7) : Spark ne peut pas prendre toute la mémoire de WSL2
+    mem_limit: 3g
+    environment:
+      # Réseau interne : kafka:29092 et postgres:5432 (aucun port publié)
+      SENPAY_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SENPAY_PG_HOST: postgres
+      SENPAY_PG_PORT: "5432"
+      SENPAY_PG_USER: ${SENPAY_PG_USER:?SENPAY_PG_USER manquant (copier .env.example en .env)}
+      SENPAY_PG_PASSWORD: ${SENPAY_PG_PASSWORD:?SENPAY_PG_PASSWORD manquant (copier .env.example en .env)}
+      SENPAY_PG_DB: ${SENPAY_PG_DB:?SENPAY_PG_DB manquant (copier .env.example en .env)}
+      SENPAY_CHECKPOINT_DIR: /opt/spark-checkpoints/transactions
+    volumes:
+      # Code du job en lecture seule ; cache Ivy et checkpoint dans des volumes nommés
+      - ./streaming:/opt/app/streaming:ro
+      - spark_ivy:/opt/spark-ivy
+      - spark_checkpoints:/opt/spark-checkpoints
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - --master
+      - local[4]
+      - --driver-memory
+      - 2g
+      # Coordonnées épinglées (I2) : dépendances transitives résolues par Ivy
+      - --conf
+      - spark.jars.packages=org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.1,org.postgresql:postgresql:42.7.14
+      - --conf
+      - spark.jars.ivy=/opt/spark-ivy
+      - --conf
+      - spark.sql.shuffle.partitions=4
+      - --conf
+      - spark.sql.session.timeZone=Africa/Dakar
+      - --conf
+      - spark.ui.enabled=false
+      - /opt/app/streaming/job.py
+
 volumes:
   kafka_data:
   pg_data:
+  # Supprimés par make reset (down -v) : le checkpoint ne survit jamais à un reset (I6)
+  spark_ivy:
+  spark_checkpoints:

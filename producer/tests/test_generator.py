@@ -19,7 +19,14 @@ from producer.anomalies import CORE_TYPES, Episode, generate_episodes
 from producer.config import GeneratorConfig
 from producer.delivery import INVALID_REASONS, corrupt
 from producer.events import EXPECTED_RULE, OUTGOING_TYPES, Emission, to_ms
-from producer.producer import Plan, plan_from_episodes, plan_run, write_dry_run
+from producer.producer import (
+    Plan,
+    RunError,
+    check_seed_unused,
+    plan_from_episodes,
+    plan_run,
+    write_dry_run,
+)
 from producer.profiles import bootstrap_profiles, build_population, expected_outgoing_30d
 from producer.tests.conftest import SEED, SIM_END, SIM_START
 from producer.tests.schema_v1 import SchemaError, validate
@@ -373,6 +380,29 @@ def test_rafale_a_cheval_sur_deux_heures(config: GeneratorConfig, day_plan: Plan
     assert all(e.truth == par_tranche[0][0].truth for t in par_tranche for e in t)
     instants = [e.emit_sim_time for tranche in tranches for e in tranche]
     assert instants == sorted(instants)
+
+
+# --- Graine unique par base -------------------------------------------------
+
+
+def test_meme_graine_memes_identifiants_sur_une_autre_plage(config: GeneratorConfig) -> None:
+    # Raison du refus : les transaction_id ne dépendent que de la graine (flux « trafic »
+    # depuis son début), pas de la plage. Deux runs de graine 42 se recouvrent.
+    jour_1 = plan_run(config, SEED, SIM_START, SIM_START + timedelta(hours=1))
+    jour_2 = plan_run(config, SEED, SIM_END, SIM_END + timedelta(hours=1))
+    premiers = [
+        {e.transaction.transaction_id for e in next(iter(p.slices()))} for p in (jour_1, jour_2)
+    ]
+    assert premiers[0] & premiers[1]
+
+
+def test_graine_deja_utilisee_refusee() -> None:
+    with pytest.raises(RunError, match="make reset"):
+        check_seed_unused(42, existing_run_id=1)
+
+
+def test_graine_libre_acceptee() -> None:
+    check_seed_unused(43, existing_run_id=None)
 
 
 # --- n° 7 : ordre -------------------------------------------------------------
