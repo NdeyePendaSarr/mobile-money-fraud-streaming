@@ -1,4 +1,4 @@
-# Mémoire mesurée (phase 1)
+# Mémoire mesurée (phases 1 et 3)
 
 Mesure du socle (profil `streaming` : Kafka + PostgreSQL) avec `docker stats`, pour vérifier le
 budget du PRD §8.4 avant d'ajouter Spark. Machine : portable Windows 11, i7-1355U, 15,6 Go de RAM,
@@ -55,3 +55,26 @@ Producteur de test (100 000 messages × 300 octets, `--throughput 1000`, `acks=a
   Grafana, à mesurer en phase 3.
 - L'écart de `free` (+0,6 Gi de `used`) concerne toute la machine virtuelle WSL2 : il peut inclure
   la JVM du conteneur de test et d'autres processus ; il n'est pas imputable au seul socle.
+
+## Phase 3 : job Spark Structured Streaming (26/11/2026)
+
+Conteneur `spark-streaming` : `local[4]`, driver 2 Go, limite du conteneur 3 Go
+(`mem_limit`), interface web de Spark désactivée. `docker stats` relevé toutes les 2 à 3 s.
+
+Runs de référence, après `make reset` : A (rattrapage de 30 530 messages, 7 lots de 5 000
+offsets au plus), puis B (347 messages à `--speed 60`, job allumé).
+
+| Conteneur | Max relevé (runs A et B) |
+|---|---|
+| `spark-streaming` | **1 731 MiB** (lot de 5 000 messages) |
+| `kafka` | 424 MiB |
+| `postgres` | 67 MiB |
+
+- Première session de mesure, même scénario : pic du job 1 683 MiB au run A (`memory.peak`
+  1 735 MiB) et 1 741 MiB au run B ; les deux sessions concordent.
+- **Au repos** (job allumé, topic rattrapé) : `spark-streaming` ≈ 820 à 900 MiB.
+- Le job reste sous 1,75 Go, soit 58 % de sa limite de 3 Go. Avec Kafka et PostgreSQL, le profil
+  `streaming` monte à ≈ 2,2 Go au pic, sous le budget de 4 à 4,5 Go (PRD §8.4), Grafana non compris.
+- CPU : jusqu'à ≈ 500 à 590 % pour `spark-streaming` pendant un lot de 5 000 messages (4 cœurs
+  du `local[4]` et la JVM) ; Kafka ≈ 240 à 260 % au pic.
+- WSL2 (`free`) : 4,3 à 4,9 Gi disponibles pile allumée, contre 6,2 Gi pile arrêtée.

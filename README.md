@@ -3,7 +3,7 @@
 > **EN —** Streaming pipeline for a fictional Senegalese mobile money fintech: synthetic
 > transactions → Kafka → Spark Structured Streaming → explainable fraud rules, per-minute KPIs and
 > alerts in PostgreSQL, live Grafana dashboard; a daily PySpark batch on the Parquet archive feeds a
-> compliance report in Power BI. **Work in progress: phases 0 to 2 of 0–9 done (design, infrastructure, data generator); next: first Spark consumer.**
+> compliance report in Power BI. **Work in progress: phases 0 to 3 of 0–9 done (design, infrastructure, data generator, first Spark consumer); next: stateless detection rules.**
 
 > ⚠️ **Données 100 % fictives.** SenPay est une fintech **fictive** ; aucune marque réelle n'est
 > utilisée. Les identifiants (`U-000123`, `M-0042`, `A-0137`) ne ressemblent pas à des numéros de
@@ -39,10 +39,11 @@ flowchart LR
     pg --> pbi["Power BI<br/>rapport conformité"]
 
     classDef enplace fill:#d1fadf,stroke:#1b7f3b;
-    class gen,tx,dl,pg enplace;
+    class gen,tx,dl,pg,sss enplace;
 ```
 
-En vert : ce qui est en place à la fin de la phase 2. Deux profils Docker Compose, jamais lancés
+En vert : ce qui est en place à la fin de la phase 3 (le job Spark lit, valide et écrit en base ;
+règles, fenêtres, `dead_letter` et archive Parquet viennent ensuite). Deux profils Docker Compose, jamais lancés
 ensemble : `streaming` (Kafka, PostgreSQL et le générateur lancé sur l'hôte, puis Spark, Grafana)
 et `batch` (PostgreSQL, puis Airflow et Spark batch).
 
@@ -53,7 +54,7 @@ et `batch` (PostgreSQL, puis Airflow et Spark batch).
 | 0 | Cadrage : schéma de l'événement, règles, mesure de la détection | ✅ |
 | 1 | Socle : Kafka KRaft, PostgreSQL, topics, tables, versions figées, mémoire mesurée | ✅ |
 | 2 | Générateur : horloge simulée, anomalies injectées, vérité terrain, retards, messages invalides | ✅ |
-| 3 | Premier consommateur Spark : lecture, validation, écriture en base | — |
+| 3 | Premier consommateur Spark : lecture, validation, écriture idempotente en base | ✅ |
 | 4 | Règles sans état : montant anormal, gros montant de nuit | — |
 | 5 | Fenêtres : rafale, indicateurs par minute, watermark | — |
 | 6 | Robustesse : checkpoints, dead letter queue, archive Parquet | — |
@@ -136,11 +137,57 @@ U-000112 | {"schema_version":1,"transaction_id":"5e1439b7-193b-4a80-b5e5-c4c1e50
 - Pas de messages en double (producteur idempotent) ; pas de dédoublonnage à tester au MVP.
 - Le motif « `event_time` dans le futur » dépend de l'heure réelle d'envoi : le `--dry-run`
   enregistre le décalage, pas la valeur.
+- Deux runs de **même graine** produisent les mêmes `transaction_id` (tirés du flux « trafic »
+  depuis son début) : le générateur refuse donc une graine déjà présente dans la base
+  (`make reset`, ou une autre graine).
+
+## Consommateur Spark (phase 3)
+
+Un job **Spark Structured Streaming** lit le topic `transactions`, valide chaque message contre
+le schéma v1 et écrit les transactions valides dans PostgreSQL. Il tourne dans le conteneur
+`spark-streaming` (image `apache/spark:4.2.1`, Python 3.10, `local[4]`, driver 2 Go, limite
+3 Go), lancé à part de `make up` :
+
+```bash
+make stream            # démarre le job (et construit l'image au premier lancement)
+make stream-logs       # une ligne par micro-batch : lus, valides, insérés, invalides par motif
+make stream-report     # chiffres du critère : envoyés = insérés + invalides, motifs, doublons
+make stream-kill       # tue le job (SIGKILL) ; make stream le relance depuis son checkpoint
+```
+
+- **Validation en expressions Spark natives, sans UDF Python** : chaque message reçoit au plus
+  un motif (`invalid_reason`), dans le même ordre de priorité que le validateur Python de
+  référence. Un JSON illisible est repéré par `from_json` et sa colonne d'enregistrement corrompu ;
+  tous les champs y sont lus en texte, pour qu'un champ mal typé ne passe pas pour un JSON illisible.
+- **Écriture idempotente** : chaque micro-batch passe par une table de transit
+  (`transactions_staging`), puis une seule transaction PostgreSQL fusionne dans `transactions`
+  (`ON CONFLICT (transaction_id) DO NOTHING`), vide le transit et écrit le bilan du lot dans
+  `stream_batches` (`ON CONFLICT (batch_id) DO NOTHING`). Un micro-batch rejoué après un arrêt
+  brutal n'insère rien deux fois et ne réécrit pas son bilan.
+- `ingested_at` = horodatage Kafka du message ; `kafka_partition` et `kafka_offset` sont gardés.
+- Les invalides sont comptés par motif dans `stream_batches` ; la file `dead_letter` viendra en
+  phase 6.
+
+**Contrôles du 26/11/2026** (`make reset`, puis deux runs du générateur) :
+
+| Contrôle | Résultat |
+|---|---|
+| Run A, arriéré : 30 530 messages (graine 42, `--speed max`), job démarré après coup | 7 micro-batchs (5 000 offsets au plus par lot) : 30 395 insérés + 135 invalides |
+| Run B, en direct : 347 messages (graine 43, `--speed 60`, job allumé) | 3 micro-batchs pendant l'envoi (86, 176, 85 messages), 343 insérés + 4 invalides |
+| Σ envoyés = transactions + invalides | **30 877 = 30 738 + 139** ; chaque message lu une fois (Σ `nb_lus` = 30 877) |
+| Σ `nb_inseres` = `COUNT(transactions)` | 30 738 = 30 738 |
+| Invalides par motif, générateur = consommateur | identiques sur les 8 motifs |
+| Doublons ; restes dans la table de transit | 0 ; 0 |
+| Job tué (SIGKILL), commit Spark du dernier lot retiré du checkpoint, job relancé | lot 9 rejoué : 0 inséré, bilan d'origine intact dans `stream_batches` (83 insérés, même `processed_at`), aucune erreur |
+| Graine déjà utilisée dans la base | run refusé avant tout envoi (« faire make reset ») |
+| Test de parité Spark ↔ validateur Python | 30 530 verdicts identiques sur le jour de référence, invalides compris |
+| Mémoire du job | pic 1 731 MiB sur 3 Go ; ≈ 820 à 900 MiB au repos ([docs/memoire.md](docs/memoire.md)) |
 
 ## Lancer le projet
 
-Prérequis : Docker, [uv](https://docs.astral.sh/uv/), make (sous Windows : WSL2 et Docker Desktop).
-Les ports 5434 (PostgreSQL) et 9092 (Kafka) doivent être libres.
+Prérequis : Docker, [uv](https://docs.astral.sh/uv/), make, et un JDK 17 pour les tests Spark sur
+l'hôte (`openjdk-17-jdk-headless`) ; sous Windows : WSL2 et Docker Desktop. Les ports 5434
+(PostgreSQL) et 9092 (Kafka) doivent être libres. Spark : au moins 6 Go libres côté Windows.
 
 ```bash
 git clone https://github.com/NdeyePendaSarr/mobile-money-fraud-streaming.git
@@ -151,6 +198,8 @@ make up                # profil streaming : Kafka, création des topics, Postgre
 make check             # lint, types, tests, topics et tables
 make generate ARGS="--seed 42 --start 2026-11-23T00:00:00Z --duration 1d --speed max --init-profiles"
 make test-integration  # run réel d'une heure simulée (écrit en base)
+make stream            # job Spark : Kafka → validation → PostgreSQL
+make stream-report     # bilan : envoyés = insérés + invalides
 make topics            # liste et décrit les topics
 make stats             # mémoire des conteneurs
 make down              # arrêt, données conservées
@@ -170,6 +219,10 @@ Profil `streaming` (Kafka + PostgreSQL), `docker stats`, 25/11/2026 :
 Charge : 100 000 messages de 300 octets envoyés à **1 000 msg/s, débit imposé** au producteur de
 test (`--throughput 1000`) et non capacité mesurée du broker ; 1 007,7 msg/s obtenus, latence
 d'envoi p50 5 ms, p95 12 ms. Kafka tient dans son budget : pas besoin du plan B Redpanda.
+
+Job Spark (phase 3, 26/11/2026) : **1 731 MiB au pic** (lot de 5 000 messages) sur une limite de
+3 Go, ≈ 820 à 900 MiB au repos ; avec Kafka et PostgreSQL, ≈ 2,2 Go au pic pour le profil
+`streaming`.
 Protocole et détail : [docs/memoire.md](docs/memoire.md).
 
 ## Licence

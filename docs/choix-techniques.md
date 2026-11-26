@@ -1,7 +1,8 @@
 # Choix techniques
 
-Choix d'implémentation du socle (phase 1) et du générateur (phase 2, décisions H1 à H22), en
-complément du cadrage de la phase 0 (décisions F1 à F22).
+Choix d'implémentation du socle (phase 1), du générateur (phase 2, décisions H1 à H22) et du
+premier consommateur Spark (phase 3, décisions I1 à I8), en complément du cadrage de la phase 0
+(décisions F1 à F22).
 
 ## PostgreSQL
 
@@ -96,3 +97,30 @@ et Saint-Louis–Kaolack). Les deux derniers sont injectés mais pas détectés 
 |---|---|---|
 | H21 | ruff garde RUF001–RUF003 actifs et n'autorise que ×, − et – (`allowed-confusables`) | Un caractère ambigu dans une chaîne reste détecté |
 | H22 | Les tests d'intégration écrivent un run en base : ils sont exclus de `make test` et lancés par `make test-integration` | Pour ne pas bloquer un run de référence ultérieur |
+
+## Consommateur Spark (phase 3)
+
+### Décisions
+
+| # | Choix | Pourquoi |
+|---|---|---|
+| I1 | Job dans un conteneur `spark-streaming` (profil `streaming`, image officielle `apache/spark:4.2.1-scala2.13-java17-python3-ubuntu` + psycopg) ; tests sur l'hôte avec `pyspark==4.2.1` et un JDK 17 | Mémoire isolée et mesurable (`docker stats`), réseau interne `kafka:29092` ; sur l'hôte, il faudrait Java de toute façon, sans isolation mémoire |
+| I2 | `spark.jars.packages` avec coordonnées épinglées (connecteur Kafka 4.2.1, pilote JDBC 42.7.14) ; cache Ivy dans un volume nommé | Les dépendances transitives du connecteur (`kafka-clients`, `commons-pool2`…) sont résolues automatiquement ; copier les jars à la main, c'est risquer d'en oublier un |
+| I3 | Validation en **expressions Spark natives, sans UDF Python** ; un motif par message, dans le même ordre de priorité que le validateur Python de référence ; **test de parité** sur les 30 530 messages du jour de référence | Une UDF Python fait passer chaque ligne de la JVM vers Python : lent et coûteux en mémoire. La parité prouve les motifs au lieu de les supposer |
+| I4 | Écriture idempotente dès la phase 3 : JDBC vers `transactions_staging` (avec `batch_id`), puis, depuis le driver et en une transaction psycopg, `INSERT … SELECT … ON CONFLICT (transaction_id) DO NOTHING` et suppression du lot | `foreachBatch` est *at-least-once* : au premier arrêt brutal, le rejeu violerait la clé primaire et le job planterait à chaque relance. Le JDBC de Spark ne sait pas faire d'upsert |
+| I5 | Table **`stream_batches`** (bilan de chaque micro-batch : lus, valides, insérés, invalides par motif), écrite une seule fois (`ON CONFLICT (batch_id) DO NOTHING`) **dans la même transaction que la fusion**. **Ajout au schéma du PRD §6.2** | Un compte d'invalides durable, fait par le consommateur et comparable motif par motif au générateur ; servira au débit dans Grafana. Un bilan présent prouve que le lot a été fusionné : un rejeu n'écrase jamais `nb_inseres` (invariant Σ `nb_inseres` = `COUNT(transactions)`, vérifié par `make stream-report`). La file `dead_letter` reste pour la phase 6 |
+| I6 | Checkpoint dès la phase 3, dans un volume nommé, supprimé par `make reset` ; `startingOffsets=earliest` | Un checkpoint qui survit à un reset reprendrait à des offsets qui n'existent plus |
+| I7 | `local[4]`, driver 2 Go, `shuffle.partitions=4`, `maxOffsetsPerTrigger=5000`, déclencheur de 5 s, `session.timeZone=Africa/Dakar`, limite du conteneur 3 Go | Budget mémoire du PRD §8.4 ; la limite empêche Spark de prendre toute la mémoire de WSL2 |
+| I8 | Deux runs de contrôle : A, arriéré (run de référence en `--speed max`, puis démarrage du job) ; B, direct (job allumé, `--speed 60`, plage postérieure à A) | A prouve le rattrapage, B le vrai streaming, dans la même session et sans reset |
+
+### Choix d'implémentation
+
+| Choix | Pourquoi |
+|---|---|
+| Le JSON est lu deux fois par `from_json` : tous les champs **en texte**, avec la colonne d'enregistrement corrompu, puis les deux entiers (`schema_version`, `amount_xof`) typés, un par appel | Avec des champs typés, un montant en texte remplirait aussi la colonne d'enregistrement corrompu et passerait pour un JSON illisible (prouvé par un test). La chaîne vide ne remplit pas cette colonne : elle est attrapée par `json_object_keys`, qui renvoie `null` pour tout ce qui n'est pas un objet JSON |
+| Motifs `CHAMP_INCONNU` et `FORMAT` en plus des 8 du générateur | Tout message hors schéma doit être écarté avant l'écriture : sinon un CHECK de `transactions` ferait échouer tout le micro-batch |
+| Fonctions `try_*` (`try_to_timestamp`) et conditions « conforme » converties avec `coalesce(…, false)` | Le mode ANSI de Spark 4 lève une erreur sur une conversion impossible ; en SQL, une comparaison avec `null` donne `null`, qui doit compter comme un échec |
+| Le code du job (`streaming/*.py`) est vérifié en **Python 3.10** (ruff `per-file-target-version`, second passage de mypy) et importé avec le `python3` de l'image (`make check-image`, appelé par `make check`) ; ses tests tournent sur l'hôte en 3.12 | L'image Spark embarque Python 3.10 : une construction de 3.11+ (`datetime.UTC`, `tomllib`…) planterait le job au démarrage. Les tests importent le générateur, qui utilise `tomllib` |
+| `make up` ne démarre que Kafka et PostgreSQL ; le job démarre par `make stream` | Le run A exige de démarrer le job après coup, sur un arriéré |
+| Interface web de Spark désactivée (`spark.ui.enabled=false`) | Mémoire et port inutiles pour un job sans opérateur |
+| Le générateur refuse une graine déjà présente dans `generator_runs` (message : faire `make reset`) ; la dérivation des identifiants est inchangée | Les `transaction_id` sont tirés du flux « trafic » de la graine depuis son début : une même graine redonnerait les mêmes identifiants, que la fusion écarterait en silence comme déjà présents |
