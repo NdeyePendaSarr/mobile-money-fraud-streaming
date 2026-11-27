@@ -3,7 +3,7 @@
 > **EN —** Streaming pipeline for a fictional Senegalese mobile money fintech: synthetic
 > transactions → Kafka → Spark Structured Streaming → explainable fraud rules, per-minute KPIs and
 > alerts in PostgreSQL, live Grafana dashboard; a daily PySpark batch on the Parquet archive feeds a
-> compliance report in Power BI. **Work in progress: phases 0 to 3 of 0–9 done (design, infrastructure, data generator, first Spark consumer); next: stateless detection rules.**
+> compliance report in Power BI. **Work in progress: phases 0 to 4 of 0–9 done (design, infrastructure, data generator, first Spark consumer, stateless rules R2 and R3); next: windowed rule R1 and per-minute KPIs.**
 
 > ⚠️ **Données 100 % fictives.** SenPay est une fintech **fictive** ; aucune marque réelle n'est
 > utilisée. Les identifiants (`U-000123`, `M-0042`, `A-0137`) ne ressemblent pas à des numéros de
@@ -42,8 +42,8 @@ flowchart LR
     class gen,tx,dl,pg,sss enplace;
 ```
 
-En vert : ce qui est en place à la fin de la phase 3 (le job Spark lit, valide et écrit en base ;
-règles, fenêtres, `dead_letter` et archive Parquet viennent ensuite). Deux profils Docker Compose, jamais lancés
+En vert : ce qui est en place à la fin de la phase 4 (le job Spark lit, valide, écrit en base et
+applique les règles R2 et R3 ; fenêtres, `dead_letter` et archive Parquet viennent ensuite). Deux profils Docker Compose, jamais lancés
 ensemble : `streaming` (Kafka, PostgreSQL et le générateur lancé sur l'hôte, puis Spark, Grafana)
 et `batch` (PostgreSQL, puis Airflow et Spark batch).
 
@@ -55,7 +55,7 @@ et `batch` (PostgreSQL, puis Airflow et Spark batch).
 | 1 | Socle : Kafka KRaft, PostgreSQL, topics, tables, versions figées, mémoire mesurée | ✅ |
 | 2 | Générateur : horloge simulée, anomalies injectées, vérité terrain, retards, messages invalides | ✅ |
 | 3 | Premier consommateur Spark : lecture, validation, écriture idempotente en base | ✅ |
-| 4 | Règles sans état : montant anormal, gros montant de nuit | — |
+| 4 | Règles sans état : montant anormal, gros montant de nuit | ✅ |
 | 5 | Fenêtres : rafale, indicateurs par minute, watermark | — |
 | 6 | Robustesse : checkpoints, dead letter queue, archive Parquet | — |
 | 7 | Batch PySpark quotidien et DAG Airflow | — |
@@ -183,6 +183,54 @@ make stream-kill       # tue le job (SIGKILL) ; make stream le relance depuis so
 | Test de parité Spark ↔ validateur Python | 30 530 verdicts identiques sur le jour de référence, invalides compris |
 | Mémoire du job | pic 1 731 MiB sur 3 Go ; ≈ 820 à 900 MiB au repos ([docs/memoire.md](docs/memoire.md)) |
 
+## Règles R2 et R3 (phase 4)
+
+Le job applique deux règles **sans état** à chaque micro-batch, en expressions Spark natives
+(seuils illustratifs dans [`config/rules.toml`](config/rules.toml)) :
+
+| Règle | Condition | Sévérité |
+|---|---|---|
+| R2 – montant anormal | sortie > 10 × la médiane du client (strict), ≥ 50 000 XOF, au moins 5 transactions dans son profil | HAUTE |
+| R3 – nuit et gros montant | sortie > 500 000 XOF, heure de Dakar dans [01:00 ; 05:00[ (indépendante du fuseau de la session Spark) | MOYENNE |
+
+- Les profils (`user_profiles`) sont **relus en base à chaque lot**, sans cache : un profil
+  modifié est pris en compte au lot suivant (test d'intégration avec témoin positif).
+- `alert_id` = SHA-256 de `R2|<transaction_id>` (ou R3) : un rejeu retombe sur la même alerte.
+  `details` garde les valeurs et les seuils appliqués.
+- Les alertes passent par une table de transit (`alerts_staging`) et sont fusionnées
+  (`ON CONFLICT DO NOTHING`) **dans la même transaction** que les transactions et le bilan du
+  lot ; `detected_at` = `clock_timestamp()`, l'heure réelle de l'écriture.
+
+**Contrôles du 26/11/2026** (`make reset`, run A en arriéré, rejeu, run C en direct) :
+
+| Contrôle | Run A : arriéré (graine 42, 30 530 messages) | Run C : en direct (graine 43, 1 journée à `--speed 60`, 24 min) |
+|---|---|---|
+| Rappel R2 (`MONTANT_ANORMAL`) | **45/45 (100 %)** | **59/59 (100 %)** |
+| Rappel R3 (`NUIT_GROS_MONTANT`) | **26/26 (100 %)** | **17/17 (100 %)** |
+| Alertes R2 : vrais / faux positifs | 229 : 70 / 159 (précision 30,6 %) | 224 : 78 / 146 (précision 34,8 %) |
+| Alertes R3 : vrais / faux positifs | 26 : 26 / 0 | 17 : 17 / 0 |
+| Latence `detected_at − ingested_at` (n, médiane, p95, max) | sans objet : messages en attente dans Kafka | R2 : 224, 5,16 s, **7,57 s**, 8,52 s ; R3 : 17, 5,24 s, **7,69 s**, 8,52 s |
+| Durée des lots | — | médiane 2,05 s, max 4,55 s (291 lots) |
+| Invariants (Σ `nb_sent` = transactions + invalides ; Σ `nb_lus` compté = Σ `nb_sent` ; doublons, transit) | 30 530 = 30 395 + 135 ; 30 530 ; 0 ; 0 | 61 063 = 60 766 + 297 (runs A + C) ; 61 063 ; 0 ; 0 |
+| Invalides par motif, générateur = consommateur | identiques sur les 8 motifs (135) | identiques sur les 8 motifs (297 = 135 + 162) |
+
+- **Vrai positif** = la transaction de l'alerte figure dans la vérité terrain, quel que soit le
+  type d'épisode : R2 attrape aussi les gros montants de nuit (25 au run A, 17 au run C) et, au
+  run C, 2 CASH_OUT d'épisodes « cash-out rapide » (R4), à 18,5 et 26,9 fois la médiane du client.
+- **Précision de R3 à 100 % : un effet de construction**, pas une performance. Le générateur ne
+  produit presque aucune sortie de nuit au-dessus de 500 000 XOF hors épisodes : ses montants de
+  nuit « près du seuil » sont plafonnés à 500 000 (non inclus dans R3, strict), et ses gros
+  montants hors épisodes sont tirés de jour. Sur de vraies données, R3 aurait des faux positifs.
+- **Faux positifs de R2** : la queue des montants log-normaux (σ = 0,9 : ≈ 0,5 % des sorties
+  dépassent 10 fois la médiane du client ; ratio médian des faux positifs ≈ 13) et les gros
+  montants de jour du trafic près des seuils. Voulus par construction : le générateur laisse
+  des faux positifs possibles (circularité, voir les limites).
+- **Rejeu** : job tué (SIGKILL), commit Spark du dernier lot retiré du checkpoint, relance :
+  0 alerte en double, `detected_at` et bilan du lot inchangés (empreinte des 255 alertes identique).
+- **Profil modifié** : médiane 10 000 → alerte R2 en 3,6 s ; médiane passée à 100 000 en base →
+  même montant, plus d'alerte, transaction en base en 5,3 s.
+- Ces chiffres valident la cohérence du système, pas son efficacité sur de vraies fraudes.
+
 ## Lancer le projet
 
 Prérequis : Docker, [uv](https://docs.astral.sh/uv/), make, et un JDK 17 pour les tests Spark sur
@@ -199,7 +247,7 @@ make check             # lint, types, tests, topics et tables
 make generate ARGS="--seed 42 --start 2026-11-23T00:00:00Z --duration 1d --speed max --init-profiles"
 make test-integration  # run réel d'une heure simulée (écrit en base)
 make stream            # job Spark : Kafka → validation → PostgreSQL
-make stream-report     # bilan : envoyés = insérés + invalides
+make stream-report     # bilan : envoyés = insérés + invalides ; détection (ARGS="--run N")
 make topics            # liste et décrit les topics
 make stats             # mémoire des conteneurs
 make down              # arrêt, données conservées
@@ -222,7 +270,8 @@ d'envoi p50 5 ms, p95 12 ms. Kafka tient dans son budget : pas besoin du plan B 
 
 Job Spark (phase 3, 26/11/2026) : **1 731 MiB au pic** (lot de 5 000 messages) sur une limite de
 3 Go, ≈ 820 à 900 MiB au repos ; avec Kafka et PostgreSQL, ≈ 2,2 Go au pic pour le profil
-`streaming`.
+`streaming`. Avec les règles R2 et R3 (phase 4, run de 24 min en direct) : **1 951 MiB au pic**
+(`memory.peak`), ≈ 2,8 Go pour le profil `streaming`.
 Protocole et détail : [docs/memoire.md](docs/memoire.md).
 
 ## Licence

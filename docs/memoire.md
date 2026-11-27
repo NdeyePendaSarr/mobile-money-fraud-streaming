@@ -1,4 +1,4 @@
-# Mémoire mesurée (phases 1 et 3)
+# Mémoire mesurée (phases 1, 3 et 4)
 
 Mesure du socle (profil `streaming` : Kafka + PostgreSQL) avec `docker stats`, pour vérifier le
 budget du PRD §8.4 avant d'ajouter Spark. Machine : portable Windows 11, i7-1355U, 15,6 Go de RAM,
@@ -78,3 +78,26 @@ offsets au plus), puis B (347 messages à `--speed 60`, job allumé).
 - CPU : jusqu'à ≈ 500 à 590 % pour `spark-streaming` pendant un lot de 5 000 messages (4 cœurs
   du `local[4]` et la JVM) ; Kafka ≈ 240 à 260 % au pic.
 - WSL2 (`free`) : 4,3 à 4,9 Gi disponibles pile allumée, contre 6,2 Gi pile arrêtée.
+
+## Phase 4 : règles R2 et R3 (26/11/2026)
+
+Run C : une journée simulée en direct (`--speed 60`, 30 533 messages en 24 min réelles, ≈ 21
+msg/s), job allumé, après le run A (30 530 messages en arriéré) ; relevé `docker stats` chaque
+seconde (461 relevés).
+
+| Conteneur | Min | Max | `memory.peak` |
+|---|---|---|---|
+| `spark-streaming` | 1 119 MiB | **1 937 MiB** | **1 951 MiB** (65 % de la limite de 3 Go) |
+| `kafka` | 336 MiB | 741 MiB | — |
+| `postgres` | 83 MiB | 96 MiB | — |
+
+- Le job monte de ≈ 1,7 Go (phase 3) à ≈ 1,95 Go : jointure avec l'instantané des 10 000 profils
+  relu à chaque lot, alertes persistées, et un JVM qui a tourné plus longtemps (run A + run C).
+- Kafka monte à ≈ 740 MiB : deux runs dans le topic (61 000 messages), cache de pages compris.
+- Total au pic ≈ 2,8 Go pour le profil `streaming`, sous le budget de 4 à 4,5 Go (Grafana non
+  compris). WSL2 (`free`) : 3,8 Gi disponibles à la fin du run C.
+- **Une première tentative du run C a été invalidée** : le portable s'est mis en veille 1 h 15 en
+  cours de run (trou de 4 498 s dans le relevé). Au réveil, le générateur a envoyé l'arriéré d'un
+  coup et l'exécuteur Spark, qui n'avait plus de contact avec son ordonnanceur, s'est arrêté
+  (60 battements de cœur perdus). Les mesures ci-dessus viennent du second run C, mené avec une
+  demande « rester éveillé » à Windows pendant la durée du run, sans aucun trou dans le relevé.

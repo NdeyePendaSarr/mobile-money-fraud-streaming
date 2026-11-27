@@ -1,8 +1,8 @@
 # Choix techniques
 
-Choix d'implémentation du socle (phase 1), du générateur (phase 2, décisions H1 à H22) et du
-premier consommateur Spark (phase 3, décisions I1 à I8), en complément du cadrage de la phase 0
-(décisions F1 à F22).
+Choix d'implémentation du socle (phase 1), du générateur (phase 2, décisions H1 à H22), du
+premier consommateur Spark (phase 3, décisions I1 à I8) et des règles R2 et R3 (phase 4,
+décisions J1 à J12), en complément du cadrage de la phase 0 (décisions F1 à F22).
 
 ## PostgreSQL
 
@@ -124,3 +124,29 @@ et Saint-Louis–Kaolack). Les deux derniers sont injectés mais pas détectés 
 | `make up` ne démarre que Kafka et PostgreSQL ; le job démarre par `make stream` | Le run A exige de démarrer le job après coup, sur un arriéré |
 | Interface web de Spark désactivée (`spark.ui.enabled=false`) | Mémoire et port inutiles pour un job sans opérateur |
 | Le générateur refuse une graine déjà présente dans `generator_runs` (message : faire `make reset`) ; la dérivation des identifiants est inchangée | Les `transaction_id` sont tirés du flux « trafic » de la graine depuis son début : une même graine redonnerait les mêmes identifiants, que la fusion écarterait en silence comme déjà présents |
+
+## Règles R2 et R3 (phase 4)
+
+| # | Choix | Pourquoi |
+|---|---|---|
+| J1 | Seuils dans `config/rules.toml`, lus avec `tomllib` si disponible, sinon `tomli` (2.4.1, épinglé dans l'image) ; clé manquante, inconnue ou valeur invalide = arrêt du job au démarrage | L'image est en Python 3.10, qui n'a pas `tomllib` : sans repli, le job planterait dans le conteneur alors que les tests passent sur l'hôte en 3.12 |
+| J2 | R2 et R3 sont appliquées dans `foreachBatch`, sur le lot validé ; `user_profiles` est **relu par JDBC à chaque lot**, sans cache. **Écart au PRD §7.1** : la technique passe de « jointure stream-statique » à « jointure lot ↔ instantané des profils » | Même comportement, mais la fraîcheur des profils ne dépend plus d'un `.cache()` posé par erreur : elle est explicite et testée (J12). C'est la condition pour que les profils recalculés la nuit (phase 7) soient vus |
+| J3 | `streaming/rules.py` : `rule_r2` et `rule_r3` en expressions Spark natives, sans UDF, qui renvoient un DataFrame au schéma fixe des alertes ; testées avec une `SparkSession` locale, sans Kafka | Pas d'aller-retour JVM ↔ Python ; les tests portent sur le code qui tourne vraiment dans le job |
+| J4 | Bornes : R2 = type sortant, montant > facteur × médiane (strict), montant ≥ plancher (inclusif), `nb_tx_30j` ≥ 5 ; profil absent ou médiane `null` : pas d'alerte, sans erreur. R3 = type sortant, montant > 500 000 (strict), heure de Dakar dans [01:00 ; 05:00[, **calculée sans dépendre du fuseau de la session** (`convert_timezone` depuis le fuseau de session) | Une seule référence pour les tests de bornes ; le cas `null` n'apparaît pas avec les profils d'amorçage, seul un test le couvre avant la phase 7 |
+| J5 | `alert_id` = SHA-256 hexadécimal minuscule d'une chaîne canonique : `R2\|<transaction_id>`, `R3\|<transaction_id>`, et dès maintenant `R1\|<sender_id>\|<window_start en UTC, yyyy-MM-dd'T'HH:mm:ss.SSS'Z'>` | Identifiant déterministe : un rejeu retombe sur la même alerte. Fixer le format de R1 maintenant évite qu'un formatage implicite dépende du fuseau de session en phase 5 |
+| J6 | Sévérités R2 = HAUTE, R3 = MOYENNE ; `details` contient les valeurs **et les seuils appliqués** | Une alerte reste compréhensible après un changement de configuration |
+| J7 | Alertes en JDBC vers `alerts_staging` (`details` en texte), puis `INSERT … SELECT …, details::jsonb, clock_timestamp() … ON CONFLICT (alert_id) DO NOTHING` **dans la même transaction** que la fusion des transactions, la purge des transits et le bilan. **`clock_timestamp()` au lieu de `now()`** | `now()` est l'heure de **début** de la transaction : toutes les alertes d'un lot auraient la même heure, prise avant la fusion, et la latence serait sous-estimée. JDBC n'écrit pas de `jsonb`, d'où le transit en texte. `ON CONFLICT DO NOTHING` ne déclenche pas le trigger `BEFORE UPDATE` : un rejeu ne lève rien |
+| J8 | `stream_batches` : `nb_alerts_by_rule`, `started_at` (début du lot côté driver), `processed_at` écrit avec `clock_timestamp()`, et **`nb_lus` compté** (`count()` du lot persisté) | Σ `nb_lus` = Σ `nb_sent` devient un contrôle indépendant de la classification ; `processed_at − started_at` = durée du lot, qui explique la latence |
+| J9 | Le lot reste persisté pendant toutes les actions (comptage, transit, règles, alertes), puis libéré | Sinon chaque action relit l'intervalle d'offsets dans Kafka, et ce temps s'ajoute à la latence |
+| J10 | Latence = `detected_at − ingested_at` de la transaction déclenchante : n, médiane, p95, max par règle, **sur un run en direct uniquement**, avec la durée des lots ; débit par défaut `--speed 60` | Sur un arriéré, les messages attendent dans Kafka : la latence n'y a pas de sens |
+| J11 | `make stream-report` : alertes par règle ; **vrai positif = transaction de l'alerte présente dans la vérité terrain, quel que soit le type** ; faux positifs ; rappel par type attendu (`MONTANT_ANORMAL` → R2, `NUIT_GROS_MONTANT` → R3) ; latence sur une fenêtre de temps réel (`--run N`) | Contrôle de cohérence ; le rapport de détection complet viendra en phase 7 |
+| J12 | Test du profil modifié, avec un témoin positif : client réservé hors population ; médiane 10 000 → alerte R2 sur un TRANSFER de 200 000 ; médiane passée à 100 000 en base → même montant, plus d'alerte, alors que la transaction est en base | Le témoin prouve que l'absence d'alerte vient du profil relu, pas d'un job arrêté. Ces messages ne sont pas dans `generator_runs` : le test passe en dernier, puis `make reset` |
+
+Choix d'implémentation de la phase 4 :
+
+| Choix | Pourquoi |
+|---|---|
+| La fusion (transactions, alertes, purge des deux transits, bilan) est une fonction à part, `merge_batch`, testée sur la vraie base dans une transaction annulée (rejeu → 0 insertion, `detected_at` et bilan inchangés) | Le chemin critique du rejeu est prouvé par un test, en plus du contrôle en conditions réelles |
+| Le journal du job signale un lot rejoué (« bilan d'origine conservé ») | Un rejeu se voit sans aller lire la base |
+| Pas de `CHECK (processed_at >= started_at)` sur `stream_batches` ; `make stream-report` signale les lots de durée négative | `started_at` vient de l'horloge du driver Spark, `processed_at` de celle de PostgreSQL : un écart entre les deux ne doit jamais faire échouer la fusion d'un lot |
+| `tomli` aussi en dépendance de dev sur l'hôte | Le second passage de mypy (Python 3.10) doit résoudre `import tomli` |
