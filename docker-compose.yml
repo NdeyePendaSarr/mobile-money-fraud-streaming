@@ -126,9 +126,12 @@ services:
       SENPAY_PG_PASSWORD: ${SENPAY_PG_PASSWORD:?SENPAY_PG_PASSWORD manquant (copier .env.example en .env)}
       SENPAY_PG_DB: ${SENPAY_PG_DB:?SENPAY_PG_DB manquant (copier .env.example en .env)}
       SENPAY_CHECKPOINT_DIR: /opt/spark-checkpoints/transactions
+      SENPAY_RULES_CONFIG: /opt/app/config/rules.toml
     volumes:
-      # Code du job en lecture seule ; cache Ivy et checkpoint dans des volumes nommés
+      # Code du job et seuils des règles en lecture seule ; cache Ivy et checkpoint
+      # dans des volumes nommés
       - ./streaming:/opt/app/streaming:ro
+      - ./config/rules.toml:/opt/app/config/rules.toml:ro
       - spark_ivy:/opt/spark-ivy
       - spark_checkpoints:/opt/spark-checkpoints
     entrypoint: ["/opt/spark/bin/spark-submit"]

@@ -19,7 +19,8 @@ UV_RUN := uv run --env-file $(ENV_FILE)
 UP_SERVICES_streaming := kafka kafka-init postgres
 UP_SERVICES_batch := postgres
 # Modules du job importés avec le python3 de l'image (Python 3.10)
-JOB_MODULES := streaming.job, streaming.validation, streaming.sinks
+JOB_MODULES := streaming.job, streaming.validation, streaming.sinks, streaming.rules, \
+	streaming.rules_config
 
 .DEFAULT_GOAL := help
 .PHONY: help env install up down reset topics stats generate stream stream-kill stream-logs \
@@ -85,8 +86,8 @@ stream-kill: env ## Tue le job Spark (SIGKILL, sans arrêt propre) ; make stream
 stream-logs: env ## Suit le journal du job (une ligne par micro-batch)
 	$(COMPOSE) --profile streaming logs -f --no-log-prefix spark-streaming
 
-stream-report: env ## Chiffres du critère de la phase 3 (envoyés, insérés, invalides, doublons)
-	$(UV_RUN) python -m scripts.stream_report
+stream-report: env ## Invariants du consommateur + détection (ARGS="--run N" : fenêtre d'un run)
+	$(UV_RUN) python -m scripts.stream_report $(ARGS)
 
 check: lint typecheck test check-image infra ## Lint, types, tests, imports dans l'image, infrastructure
 
@@ -113,5 +114,5 @@ test:
 test-integration: env ## Tests d'intégration (services démarrés ; écrit un run en base)
 	$(UV_RUN) pytest -q -m integration
 
-infra: env ## Ports publiés, topics, 10 tables, detected_at immuable (services démarrés)
+infra: env ## Ports publiés, topics, 11 tables, detected_at immuable (services démarrés)
 	$(UV_RUN) python -m scripts.check_infra

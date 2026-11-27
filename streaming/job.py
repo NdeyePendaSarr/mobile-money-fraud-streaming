@@ -18,10 +18,12 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
+from streaming.rules_config import RulesConfig, RulesConfigError, load_rules_config
 from streaming.sinks import PgSettings, process_batch
 from streaming.validation import validate
 
@@ -50,15 +52,16 @@ def read_transactions(spark: SparkSession, bootstrap: str) -> DataFrame:
     )
 
 
-def _log_batch(settings: PgSettings) -> Callable[[DataFrame, int], None]:
+def _log_batch(settings: PgSettings, rules: RulesConfig) -> Callable[[DataFrame, int], None]:
     """Fonction ``foreachBatch`` : traite le lot et écrit une ligne de bilan sur stdout."""
 
     def handle(batch: DataFrame, batch_id: int) -> None:
-        summary = process_batch(batch, batch_id, settings)
+        summary = process_batch(batch, batch_id, settings, rules)
         print(
             f"lot {summary.batch_id} : {summary.nb_lus} lus, {summary.nb_valides} valides, "
             f"{summary.nb_inseres} insérés, {summary.nb_invalides} invalides "
-            f"{summary.nb_invalid_by_reason}"
+            f"{summary.nb_invalid_by_reason}, alertes {summary.nb_alerts_by_rule} "
+            f"({summary.nb_alertes_inserees} insérées)"
             + (" (rejeu : lot déjà fusionné, bilan d'origine conservé)" if summary.replay else ""),
             flush=True,
         )
@@ -70,6 +73,14 @@ def main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="streaming.job", description=__doc__.split("\n\n")[0])
     parser.add_argument("--sink", choices=("postgres", "console"), default="postgres")
     args = parser.parse_args(argv)
+
+    # Seuils des règles lus avant Spark : une configuration invalide arrête le job (J1)
+    rules_path = Path(os.environ.get("SENPAY_RULES_CONFIG", "config/rules.toml"))
+    try:
+        rules = load_rules_config(rules_path)
+    except RulesConfigError as erreur:
+        print(f"ÉCHEC : configuration des règles : {erreur}", flush=True)
+        return 1
 
     bootstrap = os.environ.get("SENPAY_KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
     spark = SparkSession.builder.appName("senpay-streaming").getOrCreate()
@@ -93,7 +104,7 @@ def main(argv: Sequence[str]) -> int:
         settings = PgSettings.from_env()
         checkpoint = os.environ.get("SENPAY_CHECKPOINT_DIR", "/opt/spark-checkpoints/transactions")
         query = (
-            stream.writeStream.foreachBatch(_log_batch(settings))
+            stream.writeStream.foreachBatch(_log_batch(settings, rules))
             .option("checkpointLocation", checkpoint)
             .trigger(processingTime=TRIGGER)
             .queryName("transactions_postgres")

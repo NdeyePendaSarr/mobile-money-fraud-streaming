@@ -1,0 +1,19 @@
+# Seuils des règles de détection (cadrage phase 0 §3, F12 ; phase 4, J1).
+# Valeurs ILLUSTRATIVES : ni un vrai système antifraude, ni des plafonds réglementaires.
+# Le job les lit au démarrage ; une clé manquante ou une valeur invalide l'arrête.
+# Le générateur ne lit pas ce fichier : générateur et règles sont indépendants.
+
+# R2 – montant anormal : montant sortant > facteur × médiane du client (strict),
+# montant ≥ plancher (inclusif), au moins min_history transactions dans le profil.
+[r2]
+factor = 10.0
+floor_xof = 50_000
+min_history = 5
+
+# R3 – nuit + gros montant : montant sortant > seuil (strict), heure locale du
+# fuseau métier dans [hour_start ; hour_end[.
+[r3]
+amount_threshold_xof = 500_000
+hour_start = 1
+hour_end = 5
+timezone = "Africa/Dakar"

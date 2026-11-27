@@ -6,7 +6,8 @@ Contrôles :
 - les topics ``transactions`` et ``dead_letter`` existent, avec le bon nombre de
   partitions, un facteur de réplication de 1 et une rétention de 7 jours ;
 - les 8 tables du PRD §6.2, plus ``transactions_staging`` et ``stream_batches``
-  (phase 3), existent dans le schéma ``public`` de SENPAY_PG_DB ;
+  (phase 3) et ``alerts_staging`` (phase 4), existent dans le schéma ``public`` de
+  SENPAY_PG_DB ;
 - un UPDATE de ``alerts.detected_at`` échoue (essai dans une transaction annulée).
 
 Paramètres lus dans l'environnement (``make check`` charge ``.env``) :
@@ -95,6 +96,8 @@ TABLES_ATTENDUES: frozenset[str] = frozenset(
         # Phase 3 : transit du consommateur et bilan par micro-batch (ajout au PRD §6.2)
         "transactions_staging",
         "stream_batches",
+        # Phase 4 : transit des alertes (J7)
+        "alerts_staging",
     }
 )
 

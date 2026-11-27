@@ -1,28 +1,81 @@
-"""Chiffres du critère de fin de la phase 3 (``make stream-report``).
+"""Chiffres du critère des phases 3 et 4 (``make stream-report [ARGS="--run N"]``).
 
-Compare ce que le générateur a envoyé (``generator_runs``) à ce que le
-consommateur Spark a lu, inséré et écarté (``transactions``, ``stream_batches``) :
+**Invariants du consommateur** (phase 3, toute la base ; ils fixent le code de sortie) :
 
 - Σ ``nb_sent`` = ``COUNT(transactions)`` + Σ ``stream_batches.nb_invalides`` ;
-- Σ ``nb_lus`` = Σ ``nb_sent`` (chaque message lu une fois, rejeux compris) ;
+- Σ ``nb_lus`` (compté sur chaque lot, J8) = Σ ``nb_sent`` ;
 - Σ ``nb_inseres`` = ``COUNT(transactions)`` (un rejeu n'écrase jamais un bilan) ;
 - invalides par motif : générateur = consommateur ;
-- aucun doublon, ni par ``transaction_id`` ni par (partition, offset) ;
-- ``transactions_staging`` vide (aucun lot à moitié fusionné).
+- aucun doublon ; ``transactions_staging`` et ``alerts_staging`` vides.
 
-Code de sortie : 0 si tout concorde, 1 sinon, 2 si la base est injoignable.
+**Détection** (phase 4, J10 et J11 ; informatif) sur une fenêtre de temps réel :
+``--run N`` (de ``started_at`` à ``ended_at`` du run N), ou ``--since`` / ``--until``
+(ISO 8601), sinon toute la base :
+
+- alertes par règle ; **vrai positif** = ``transaction_id`` de l'alerte présent dans
+  ``injected_anomalies``, quel que soit le type (phase 0 §4) ; faux positifs ;
+- **rappel par type attendu** : ``MONTANT_ANORMAL`` → R2, ``NUIT_GROS_MONTANT`` → R3
+  (épisodes du run N, sinon de tous les runs), avec les épisodes ratés ;
+- **latence** = ``detected_at − ingested_at`` par règle : n, médiane, p95, max ;
+  durée des lots (``processed_at − started_at``) : n, médiane, max. La latence n'a de
+  sens que sur un run en direct (pas sur un arriéré, J10).
+
+Code de sortie : 0 si les invariants concordent, 1 sinon, 2 si la base est injoignable.
 Le job doit avoir rattrapé tout le topic avant la lecture (voir ``make stream-logs``).
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import psycopg
+
+# Types d'épisodes que les règles de la phase 4 doivent attraper
+RAPPEL_ATTENDU: tuple[tuple[str, str], ...] = (
+    ("MONTANT_ANORMAL", "R2"),
+    ("NUIT_GROS_MONTANT", "R3"),
+)
+
+# Fenêtre de temps réel : bornes nulles = pas de borne
+FENETRE = (
+    "ingested_at >= coalesce(%(debut)s::timestamptz, '-infinity') "
+    "and ingested_at <= coalesce(%(fin)s::timestamptz, 'infinity')"
+)
+
+DETECTION_QUERIES: dict[str, str] = {
+    "alertes": "select a.rule_id, count(*), count(*) filter (where exists "
+    "(select 1 from injected_anomalies i where i.transaction_id = a.transaction_id)) "
+    f"from alerts a where {FENETRE} group by a.rule_id order by a.rule_id",
+    "rappel": "select count(distinct i.anomaly_id), count(distinct i.anomaly_id) filter "
+    "(where exists (select 1 from alerts a where a.transaction_id = i.transaction_id "
+    "and a.rule_id = %(regle)s)) from injected_anomalies i "
+    "where i.anomaly_type = %(type)s and (%(run)s::bigint is null or i.run_id = %(run)s)",
+    "rates": "select i.anomaly_id, i.transaction_id, i.event_time from injected_anomalies i "
+    "where i.anomaly_type = %(type)s and (%(run)s::bigint is null or i.run_id = %(run)s) "
+    "and not exists (select 1 from alerts a where a.transaction_id = i.transaction_id "
+    "and a.rule_id = %(regle)s) order by i.event_time limit 5",
+    "latence": "select rule_id, count(*), "
+    "percentile_cont(0.5) within group (order by extract(epoch from detected_at - ingested_at)), "
+    "percentile_cont(0.95) within group (order by extract(epoch from detected_at - ingested_at)), "
+    "max(extract(epoch from detected_at - ingested_at)) "
+    f"from alerts where {FENETRE} group by rule_id order by rule_id",
+    # Lots démarrés dans la fenêtre (jusqu'à 1 min après la fin : derniers messages)
+    # started_at (horloge du driver) et processed_at (horloge de PostgreSQL) viennent de
+    # deux horloges : une durée négative est signalée, jamais bloquante (pas de CHECK)
+    "lots": "select count(*), "
+    "percentile_cont(0.5) within group (order by extract(epoch from processed_at - started_at)), "
+    "max(extract(epoch from processed_at - started_at)), "
+    "count(*) filter (where processed_at < started_at), "
+    "min(extract(epoch from processed_at - started_at)) from stream_batches "
+    "where started_at >= coalesce(%(debut)s::timestamptz, '-infinity') "
+    "and started_at <= coalesce(%(fin)s::timestamptz + interval '1 minute', 'infinity')",
+}
 
 QUERIES: dict[str, str] = {
     "runs": "select count(*), count(*) filter (where ended_at is null), "
@@ -31,7 +84,8 @@ QUERIES: dict[str, str] = {
     "count(distinct (kafka_partition, kafka_offset)) from transactions",
     "batches": "select count(*), coalesce(sum(nb_lus), 0), coalesce(sum(nb_valides), 0), "
     "coalesce(sum(nb_inseres), 0), coalesce(sum(nb_invalides), 0) from stream_batches",
-    "staging": "select count(*) from transactions_staging",
+    "staging": "select (select count(*) from transactions_staging) "
+    "+ (select count(*) from alerts_staging)",
     "motifs_generateur": "select key, sum(value::bigint) from generator_runs, "
     "jsonb_each_text(nb_invalid_by_reason) group by key",
     "motifs_consommateur": "select key, sum(value::bigint) from stream_batches, "
@@ -77,7 +131,7 @@ class Report:
         if self.nb_inseres != self.nb_transactions:
             ecarts.append(f"Σ nb_inseres {self.nb_inseres} ≠ transactions {self.nb_transactions}")
         if self.nb_staging:
-            ecarts.append(f"{self.nb_staging} ligne(s) restée(s) dans transactions_staging")
+            ecarts.append(f"{self.nb_staging} ligne(s) restée(s) dans les tables de transit")
         gen = {k: v for k, v in self.motifs_generateur.items() if v}
         if gen != self.motifs_consommateur:
             ecarts.append(f"invalides par motif : générateur {gen} ≠ consommateur")
@@ -134,7 +188,94 @@ def print_report(report: Report) -> None:
         print(f"  {motif:<24} {gen:>6} | {cons:<6} {'' if gen == cons else '← écart'}")
 
 
-def main(env: Mapping[str, str] = os.environ) -> int:
+# --- Détection (phase 4) --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Fenetre:
+    """Fenêtre de temps réel des chiffres de détection ; bornes ``None`` = ouvertes."""
+
+    debut: datetime | None
+    fin: datetime | None
+    run_id: int | None
+    libelle: str
+
+
+def window_for(
+    db: psycopg.Connection[tuple[Any, ...]],
+    run_id: int | None,
+    since: datetime | None,
+    until: datetime | None,
+) -> Fenetre:
+    """Fenêtre du run ``run_id`` (started_at → ended_at), ou bornes données."""
+    if run_id is None:
+        libelle = "toute la base" if since is None and until is None else "fenêtre donnée"
+        return Fenetre(since, until, None, libelle)
+    row = db.execute(
+        "select started_at, ended_at from generator_runs where run_id = %s", (run_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"run {run_id} absent de generator_runs")
+    return Fenetre(row[0], row[1], run_id, f"run {run_id}")
+
+
+def _secondes(value: Any) -> str:
+    return "—" if value is None else f"{float(value):.2f} s"
+
+
+def print_detection(db: psycopg.Connection[tuple[Any, ...]], fenetre: Fenetre) -> None:
+    """Alertes, vrais et faux positifs, rappel par type attendu, latence, durée des lots."""
+    params: dict[str, Any] = {"debut": fenetre.debut, "fin": fenetre.fin, "run": fenetre.run_id}
+    bornes = f"{fenetre.debut} → {fenetre.fin}" if fenetre.debut or fenetre.fin else "sans borne"
+    print(f"\n--- détection : {fenetre.libelle} ({bornes})")
+
+    print("alertes par règle       : total | vrais positifs | faux positifs | précision")
+    for regle, total, vrais in db.execute(DETECTION_QUERIES["alertes"], params).fetchall():
+        precision = f"{100 * vrais / total:.1f} %" if total else "—"
+        print(f"  {regle:<4} {total:>18} | {vrais:>14} | {total - vrais:>13} | {precision}")
+
+    print("rappel par type attendu :")
+    for anomaly_type, regle in RAPPEL_ATTENDU:
+        p = {**params, "type": anomaly_type, "regle": regle}
+        row = db.execute(DETECTION_QUERIES["rappel"], p).fetchone()
+        assert row is not None
+        episodes, detectes = int(row[0]), int(row[1])
+        rappel = f"{100 * detectes / episodes:.1f} %" if episodes else "—"
+        print(f"  {anomaly_type:<18} → {regle} : {detectes}/{episodes} épisodes ({rappel})")
+        for anomaly_id, tx_id, event_time in db.execute(DETECTION_QUERIES["rates"], p).fetchall():
+            print(f"    raté : épisode {anomaly_id}, transaction {tx_id}, event_time {event_time}")
+
+    print("latence detected_at − ingested_at : n | médiane | p95 | max")
+    for regle, n, mediane, p95, maximum in db.execute(
+        DETECTION_QUERIES["latence"], params
+    ).fetchall():
+        print(
+            f"  {regle:<4} {n:>6} | {_secondes(mediane)} | {_secondes(p95)} | {_secondes(maximum)}"
+        )
+    lots = db.execute(DETECTION_QUERIES["lots"], params).fetchone()
+    assert lots is not None
+    mediane, maximum = _secondes(lots[1]), _secondes(lots[2])
+    print(f"durée des lots          : n {lots[0]} | médiane {mediane} | max {maximum}")
+    if lots[3]:
+        print(
+            f"ATTENTION : {lots[3]} lot(s) de durée négative (min {_secondes(lots[4])}) : "
+            "écart entre l'horloge du driver et celle de PostgreSQL"
+        )
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="stream_report", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--run", type=int, help="fenêtre du run N (temps réel d'envoi)")
+    parser.add_argument("--since", type=datetime.fromisoformat, help="début, ISO 8601 avec fuseau")
+    parser.add_argument("--until", type=datetime.fromisoformat, help="fin, ISO 8601 avec fuseau")
+    args = parser.parse_args(argv)
+    if args.run is not None and (args.since or args.until):
+        parser.error("--run ou --since/--until, pas les deux")
+    return args
+
+
+def main(argv: Sequence[str] = (), env: Mapping[str, str] = os.environ) -> int:
+    args = parse_args(argv)
     try:
         with psycopg.connect(
             host=env["SENPAY_PG_HOST"],
@@ -145,17 +286,21 @@ def main(env: Mapping[str, str] = os.environ) -> int:
             connect_timeout=10,
         ) as db:
             report = read_report(db)
+            print_report(report)
+            print_detection(db, window_for(db, args.run, args.since, args.until))
     except (KeyError, psycopg.OperationalError) as erreur:
         print(f"ÉCHEC : base injoignable ou configuration manquante : {erreur}")
         return 2
-    print_report(report)
+    except ValueError as erreur:
+        print(f"ÉCHEC : {erreur}")
+        return 2
     ecarts = report.ecarts()
     for ecart in ecarts:
         print(f"ÉCHEC : {ecart}")
     if not ecarts:
-        print("OK : critère de la phase 3 rempli")
+        print("OK : invariants du consommateur vérifiés")
     return 1 if ecarts else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

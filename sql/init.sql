@@ -79,6 +79,8 @@ create index transactions_staging_batch_idx on transactions_staging (batch_id);
 -- invalides par motif, fait par le consommateur (comparable au générateur).
 -- Écrit une seule fois (ON CONFLICT (batch_id) DO NOTHING), dans la même
 -- transaction que la fusion : un micro-batch rejoué garde son bilan d'origine.
+-- Phase 4 (J8) : nb_lus est COMPTÉ (count du lot), pas déduit ; nb_alerts_by_rule
+-- et started_at ajoutés ; processed_at − started_at = durée du lot.
 -- ---------------------------------------------------------------------------
 create table stream_batches (
     batch_id             bigint      primary key check (batch_id >= 0),
@@ -88,10 +90,38 @@ create table stream_batches (
     nb_invalides         integer     not null check (nb_invalides >= 0),
     nb_invalid_by_reason jsonb       not null default '{}'
         check (jsonb_typeof(nb_invalid_by_reason) = 'object'),
-    processed_at         timestamptz not null default now(),
+    -- Alertes produites par règle dans le lot, ex. {"R2": 3, "R3": 1}
+    nb_alerts_by_rule    jsonb       not null default '{}'
+        check (jsonb_typeof(nb_alerts_by_rule) = 'object'),
+    started_at           timestamptz not null,           -- début du lot, côté driver
+    processed_at         timestamptz not null default now(),  -- écrit avec clock_timestamp()
+    -- Pas de CHECK processed_at >= started_at : deux horloges différentes (driver
+    -- Spark, serveur PostgreSQL) ; un écart ne doit jamais faire échouer la fusion.
+    -- make stream-report signale les lots de durée négative.
     check (nb_lus = nb_valides + nb_invalides),
     check (nb_inseres <= nb_valides)
 );
+
+-- ---------------------------------------------------------------------------
+-- alerts_staging : transit des alertes d'un micro-batch (phase 4, J7).
+-- JDBC n'écrit pas de jsonb : details arrive en texte et devient jsonb à la
+-- fusion, dans la même transaction que la fusion des transactions et le bilan.
+-- ---------------------------------------------------------------------------
+create table alerts_staging (
+    batch_id       bigint      not null,
+    alert_id       text        not null,
+    rule_id        text        not null,
+    transaction_id text,
+    sender_id      text        not null,
+    severity       text        not null,
+    event_time     timestamptz,
+    window_start   timestamptz,
+    window_end     timestamptz,
+    ingested_at    timestamptz not null,
+    details        text        not null
+);
+
+create index alerts_staging_batch_idx on alerts_staging (batch_id);
 
 -- ---------------------------------------------------------------------------
 -- kpi_minute : fenêtres fixes de 1 min sur event_time (streaming, phase 5, F18)
